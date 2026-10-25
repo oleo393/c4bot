@@ -630,6 +630,16 @@ def close_session(sess):
     sess.close()
 
 
+def waiting_banner(page):
+    try:
+        return bool(page.evaluate(r"""() => {
+            const e = document.querySelector('[class*="_turn"][data-tone]');
+            return !!e && /WAITINGFORANOPPONENT/.test(e.innerText.replace(/[\s\u00a0]+/g, '').toUpperCase());
+        }"""))
+    except Exception:
+        return False
+
+
 def diag(page, game, seat, turn, col, why):
     """One-off diagnostic. Goes to the private Discord webhook only (never the public Actions log)."""
     try:
@@ -785,14 +795,20 @@ def play_game(sess, solver, wait_s):
         try:
             if btn.count() and btn.is_enabled():
                 real_click(page, btn)
+                tries.pop("_nb", None)
                 played_key, played_at = key, time.time()
                 tries[key] = tries.get(key, 0) + 1
                 if tries[key] == 3 and "noeffect" not in diag_sent:
                     diag_sent.add("noeffect")
                     diag(page, game, seat, turn, col, "clicked this column 3 times but the position never changed")
-            elif "nobtn" not in diag_sent:
-                diag_sent.add("nobtn")
-                diag(page, game, seat, turn, col, "column button missing or disabled on our turn")
+            elif waiting_banner(page):
+                tries.pop("_nb", None)        # nobody has joined yet: disabled buttons are expected
+                page.wait_for_timeout(500)
+            else:
+                tries.setdefault("_nb", time.monotonic())
+                if time.monotonic() - tries["_nb"] > 8 and "nobtn" not in diag_sent:
+                    diag_sent.add("nobtn")
+                    diag(page, game, seat, turn, col, "opponent present but column button still missing/disabled after 8s")
         except Exception as e:
             print("click failed:", type(e).__name__, flush=True)
             if "exc" not in diag_sent:
