@@ -1,0 +1,22 @@
+{
+  "enabled": true,
+  "stake": "1000",
+  "seat": "auto",
+  "max_loss": 0,
+  "max_games": 0,
+  "min_balance": 0,
+  "notify_every": 1,
+  "reset_pnl_token": "",
+  "opponent_wait_s": 1800,
+  "safe_remaining_s": 2,
+  "min_delay_ms": 400,
+  "cf_retry_minutes": [
+    3,
+    5,
+    10,
+    20,
+    30,
+    60
+  ],
+  "cf_give_up_min": 300
+}

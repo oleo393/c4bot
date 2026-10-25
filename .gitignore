@@ -1,0 +1,8 @@
+storage_state*.json
+.secret
+config.json
+state.enc
+stats.enc
+stats.json
+__pycache__/
+*.pyc

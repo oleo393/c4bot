@@ -1,0 +1,44 @@
+name: connect4-bot
+
+on:
+  workflow_dispatch:        # "Run workflow" button (collaborators only)
+  schedule:
+    - cron: "7 * * * *"     # hourly; exits quietly if enabled=false in the private config
+
+permissions:
+  contents: write           # only used by the keep-alive step below
+
+concurrency:
+  group: connect4-bot       # one run at a time; a queued run starts when the previous ends
+  cancel-in-progress: false
+
+jobs:
+  play:
+    if: github.repository_owner == github.actor || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      STATE_KEY: ${{ secrets.STATE_KEY }}
+      STATE_JSON: ${{ secrets.STATE_JSON }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      C4_DATA_REPO: ${{ secrets.C4_DATA_REPO }}
+      C4_DATA_TOKEN: ${{ secrets.C4_DATA_TOKEN }}
+      C4_PLAYER_ID: ${{ secrets.C4_PLAYER_ID }}
+      C4_MAX_RUNTIME_MIN: "335"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - run: pip install -r requirements.txt
+      - name: Run bot
+        run: python c4bot.py
+      - name: Keep scheduled runs alive (public repos pause them after 60 days without commits)
+        if: always()
+        run: |
+          last=$(git log -1 --format=%ct); now=$(date +%s)
+          if [ $(( (now - last) / 86400 )) -ge 30 ]; then
+            git config user.name "c4bot"; git config user.email "c4bot@users.noreply.github.com"
+            git commit --allow-empty -m "keepalive" && git push
+          fi
