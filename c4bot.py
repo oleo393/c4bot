@@ -32,6 +32,7 @@ STATE_FILE = HERE / "storage_state.json"   # decrypted copy, never committed
 STATS_FILE = HERE / "stats.enc"            # local-dev fallback (gitignored)
 SECRET_FILE = HERE / ".secret"
 BOOKS_DIR = os.environ.get("C4_BOOKS_DIR", str(HERE / "books"))
+RUN_START = time.monotonic()
 MAX_RUNTIME_MIN = float(os.environ.get("C4_MAX_RUNTIME_MIN", "0") or 0)  # 0 = unlimited
 
 DEFAULT_CFG = {
@@ -44,7 +45,7 @@ DEFAULT_CFG = {
     "min_balance": 0,           # stop if balance drops below this (0 = off)
     "notify_every": 1,          # Discord message every N games (0 = errors only)
     "reset_pnl_token": "",      # change this value to reset the P/L counters
-    "opponent_wait_s": 1800,    # give up on an unjoined listing after this long
+    "opponent_wait_s": 1800,    # give up on an unjoined listing after this many seconds (0 = never)
     "safe_remaining_s": 2,      # play best-so-far when the turn timer is this low
     "min_delay_ms": 400,        # wait this long after a new position before clicking
     "cf_retry_minutes": [3, 5, 10, 20, 30, 60],  # waits between retries when Cloudflare blocks (last value repeats)
@@ -380,6 +381,7 @@ class Session:
             self.ctx.add_init_script(STEALTH_JS)
             self.page = self.ctx.new_page()
             self.q = deque(maxlen=500)
+            self.listing = None   # game id of our still-unjoined listing ("?" = created, id not seen yet)
             self.page.on("response", self._on_response)
         except Exception:
             self.browser.close()
@@ -453,6 +455,7 @@ def create_game(sess, stake):
     if not btn.is_enabled():
         raise BotError("'Create game' button is disabled (balance too low or an open game exists?)", shot(page))
     real_click(page, btn)
+    sess.listing = "?"
 
 
 # ---------------------------------------------------------------- game logic
@@ -552,6 +555,81 @@ def dom_tone(page):
         return None
 
 
+# ---- cancelling an unjoined listing ------------------------------------------------------------
+# Two places show a Cancel button for our waiting game (never click "Call bot", the primary button next to it):
+#   1) the game window:    div.pxHubq_modalActions > button.pxHubq_secondary "Cancel"  (only while the
+#                          status line div.pxHubq_turn has data-tone="wait")
+#   2) the listing card in the lobby: div.pxHubq_cardActions > button.pxHubq_secondary "Cancel"
+WAITING_TONE = "div.pxHubq_turn[data-tone='wait']"
+MODAL_CANCEL = "div.pxHubq_modalActions button.pxHubq_secondary:text-is('Cancel')"
+CONFIRM_RE = re.compile(r"^\s*(confirm|yes|yes, cancel|cancel (game|battle|match|listing))\s*$", re.I)
+
+
+def _card_cancel(page, gid):
+    if gid and re.fullmatch(r"[0-9A-Fa-f-]{8,64}", gid):   # our card = the one whose avatar URL has our game id
+        return page.locator("xpath=//div[contains(@class,'cardActions')]/button[normalize-space()='Cancel']"
+                            f"[../..//img[contains(@src,'/game/{gid}/')]]")
+    return page.locator("xpath=//div[contains(@class,'cardActions')]/button[normalize-space()='Cancel']")
+
+
+def _press(page, loc):
+    try:
+        if loc.count() == 0 or not loc.first.is_visible():
+            return False
+        try:
+            real_click(page, loc.first)
+        except Exception:
+            loc.first.click(timeout=3000)
+        page.wait_for_timeout(800)
+        extra = page.locator("[role=dialog] button, [class*='confirm'] button").filter(has_text=CONFIRM_RE)
+        if extra.count():                       # in case the site asks "are you sure?"
+            extra.first.click(timeout=3000)
+            page.wait_for_timeout(800)
+        return True
+    except Exception as e:
+        print("cancel click failed:", type(e).__name__, flush=True)
+        return False
+
+
+def cancel_listing(sess):
+    """Cancel our unjoined listing (game window first, else the lobby card). True = cancelled or nothing to cancel."""
+    gid = sess.listing
+    if not gid:
+        return True
+    page = sess.page
+    try:
+        for attempt in range(2):
+            done = False
+            if page.locator(WAITING_TONE).count() and _press(page, page.locator(MODAL_CANCEL)):
+                done = True
+            elif _press(page, _card_cancel(page, gid)):
+                done = True
+            if done:
+                page.wait_for_timeout(1200)
+                still = (page.locator(WAITING_TONE).count() and page.locator(MODAL_CANCEL).count()) \
+                    or _card_cancel(page, gid).count()
+                if not still:
+                    sess.listing = None
+                    return True
+            if attempt == 0:   # nothing visible/clickable here: open the lobby and look for the card
+                page.goto(LOBBY_URL, wait_until="domcontentloaded", timeout=25000)
+                page.wait_for_timeout(2500)
+    except Exception as e:
+        print("cancel_listing failed:", type(e).__name__, flush=True)
+    return False
+
+
+def close_session(sess):
+    """Cancel any waiting listing first, then close the browser."""
+    if sess is None:
+        return
+    if sess.listing:
+        ok = cancel_listing(sess)
+        notify("🧹 Cancelled the unjoined listing." if ok else
+               "⚠️ Could not cancel the unjoined listing. Please cancel it on the site by hand.")
+    sess.close()
+
+
 def play_game(sess, solver, wait_s):
     """Wait for the listing to be joined, play it to the end. Returns (game, role, sol) or None if nobody joined."""
     page, q = sess.page, sess.q
@@ -581,6 +659,7 @@ def play_game(sess, solver, wait_s):
                 if is_done(g) or my_seat(g, cfg) is None:
                     continue
                 gid = rgid
+                sess.listing = gid
                 print("[game] tracking" if IN_ACTIONS else f"[game] tracking {gid}", flush=True)
             elif rgid != gid:
                 continue
@@ -594,6 +673,7 @@ def play_game(sess, solver, wait_s):
                 req = solver.request(cols) if cols else None
             if g.get("opponentId") or moves:
                 joined_at = joined_at or time.monotonic()
+                sess.listing = None          # someone joined: nothing to cancel any more
 
         if game is None:
             if time.monotonic() - t_start > 45 and gid is None:
@@ -607,6 +687,7 @@ def play_game(sess, solver, wait_s):
         sol = solver.get(req) if req else {}
 
         if is_done(game):
+            sess.listing = None
             return game, seat, sol
         if sol.get("over"):
             over_since = over_since or time.monotonic()
@@ -614,8 +695,11 @@ def play_game(sess, solver, wait_s):
                 return game, seat, sol
             page.wait_for_timeout(250)
             continue
-        if joined_at is None and time.monotonic() - t_start > wait_s:
-            return None
+        if joined_at is None:
+            if wait_s and time.monotonic() - t_start > wait_s:   # opponent_wait_s = 0 -> wait forever
+                return None
+            if not cfg["enabled"] or (MAX_RUNTIME_MIN and (time.monotonic() - RUN_START) / 60 > MAX_RUNTIME_MIN):
+                return None   # nobody joined yet: let the run stop instead of waiting
 
         # ---- whose turn ----
         turn = game.get("turn") if game.get("turn") in SEATS else None
@@ -695,6 +779,10 @@ def main():
     if not cfg["enabled"]:
         print("Disabled in config.json. Exiting.")
         return 0
+    if cfg.get("reset_pnl_token") == stats.get("reset_token") and cfg["max_loss"] \
+            and stats["pnl"] <= -parse_amount(cfg["max_loss"]):
+        print("Max loss already reached (change reset_pnl_token or max_loss to continue). Exiting.")
+        return 0
     solver = Solver()
     notify(f"▶️ Connect 4 bot started · {now_str()}\nBooks: {solver.books}\n"
            f"Stake {fmt(parse_amount(cfg['stake']))} · seat {cfg['seat']} · P/L so far {fmt_signed(stats['pnl'])}")
@@ -750,7 +838,9 @@ def main():
                     create_game(sess, stake)
                     result = play_game(sess, solver, float(cfg["opponent_wait_s"]))
                     if result is None:
-                        notify(f"⌛ No opponent joined within {cfg['opponent_wait_s']}s; recreating the listing.")
+                        ok = cancel_listing(sess)      # never leave an unjoined listing behind
+                        notify("⌛ Stopped waiting for an opponent · " +
+                               ("listing cancelled." if ok else "COULD NOT CANCEL the listing, check the site."))
                         lobby_ready = False
                         continue
                     game, role, sol = result
@@ -794,8 +884,7 @@ def main():
                         if blocked_n == 1 or blocked_n % 3 == 0:
                             notify(f"🛡️ Blocked ({e}) · attempt {blocked_n}. Retrying in {wait_min:.0f} min.",
                                    e.shot if blocked_n == 1 else None)
-                        if sess:
-                            sess.close(); sess = None      # fresh browser for the next try
+                        close_session(sess); sess = None   # fresh browser for the next try
                         lobby_ready = False
                         if not nap(wait_min * 60):
                             reason = "stopped while waiting out a block"
@@ -815,8 +904,7 @@ def main():
                     errors += 1
 
                 if errors:
-                    if sess:
-                        sess.close(); sess = None
+                    close_session(sess); sess = None
                     if errors >= MAX_CONSECUTIVE_ERRORS:
                         exit_code, reason = 1, f"{errors} consecutive errors"; break
                     time.sleep(ERROR_BACKOFF)
@@ -824,6 +912,13 @@ def main():
         reason = "interrupted (workflow cancelled?)"
     finally:
         if sess:
+            try:
+                if sess.listing:           # terminated while waiting for an opponent: cancel the listing first
+                    ok = cancel_listing(sess)
+                    notify("🧹 Cancelled the unjoined listing before stopping." if ok else
+                           "⚠️ Could not cancel the unjoined listing. Please cancel it on the site by hand.")
+            except BaseException:
+                pass
             if exit_code != 2 and not errors:
                 save_state(sess.ctx)
             sess.close()

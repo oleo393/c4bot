@@ -50,3 +50,9 @@ The bot waits and retries with a fresh browser each time: 3, 5, 10, 20, 30, then
 (`cf_retry_minutes` in the private config.json, ±jitter). You get a webhook message on the 1st and every 3rd failed
 attempt, and one when it clears. After `cf_give_up_min` (default 300) minutes blocked in a row it stops that run and the
 next hourly run tries again. Blocks never count toward the "5 consecutive errors" stop.
+
+## Unjoined listings are cancelled
+If the bot stops while your game is still "Waiting for opponent" (opponent wait timeout, `enabled: false`, the 335-minute
+limit, an error, or you cancel the workflow), it presses **Cancel** first: in the game window if it is open, otherwise on
+the listing card in the lobby (matched by game id). It never presses "Call bot". You get a Discord message saying whether
+the cancel worked. A workflow cancelled from GitHub only gives the bot a few seconds, so that path is best-effort.
