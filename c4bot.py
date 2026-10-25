@@ -630,6 +630,35 @@ def close_session(sess):
     sess.close()
 
 
+def diag(page, game, seat, turn, col, why):
+    """One-off diagnostic. Goes to the private Discord webhook only (never the public Actions log)."""
+    try:
+        info = page.evaluate("""(col) => {
+            const all = [...document.querySelectorAll('button[aria-label]')];
+            const labels = all.map(b => b.getAttribute('aria-label')).filter(l => /column|drop|disc/i.test(l));
+            const t = document.querySelector('button[aria-label="Drop a disc in column ' + (col + 1) + '"]');
+            let hit = null, box = null;
+            if (t) {
+                const r = t.getBoundingClientRect();
+                box = [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)];
+                const e = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+                hit = e ? ((e === t || t.contains(e)) ? 'target' : e.tagName + '.' + String(e.className).slice(0, 60)) : null;
+            }
+            const tone = document.querySelector('[class*="_turn"][data-tone]');
+            return {labels: labels.slice(0, 10), nLabels: labels.length, found: !!t,
+                    disabled: t ? (t.disabled || t.getAttribute('aria-disabled')) : null, box, hit,
+                    tone: tone ? tone.dataset.tone : null, toneText: tone ? tone.innerText.slice(0, 40) : null};
+        }""", col)
+    except Exception as e:
+        info = {"evaluate_error": type(e).__name__}
+    g = game or {}
+    mv = g.get("moves") or [{}]
+    notify(f"\U0001F50D Bot diagnostic: {why}\n"
+           f"seat={seat} turn_calc={turn} api_turn={g.get('turn')!r} viewer={g.get('viewer')!r} "
+           f"moves={len(g.get('moves') or [])} status={g.get('status')!r}\n"
+           f"api_keys={sorted(g.keys())}\nmove_keys={sorted(mv[0].keys())}\npage={info}", shot(page))
+
+
 def play_game(sess, solver, wait_s):
     """Wait for the listing to be joined, play it to the end. Returns (game, role, sol) or None if nobody joined."""
     page, q = sess.page, sess.q
@@ -643,6 +672,7 @@ def play_game(sess, solver, wait_s):
     over_since = None
     joined_at = None
     cfg, cfg_at = get_cfg(), time.monotonic()
+    diag_sent, tries = set(), {}
 
     while True:
         if time.monotonic() - cfg_at > 20:
@@ -707,6 +737,9 @@ def play_game(sess, solver, wait_s):
             turn = moves[0]["seat"] if n % 2 == 0 else other(moves[0]["seat"])
         if turn is None and (game.get("opponentId") or n):
             turn = dom_tone(page)
+        if joined_at and time.time() - seen_at > 60 and "stall" not in diag_sent:
+            diag_sent.add("stall")
+            diag(page, game, seat, turn, 3, "no position change for 60s (possible stall; check turn_calc vs seat)")
         if turn != seat or (time.time() - seen_at) * 1000 < cfg["min_delay_ms"]:
             page.wait_for_timeout(150)
             continue
@@ -753,8 +786,18 @@ def play_game(sess, solver, wait_s):
             if btn.count() and btn.is_enabled():
                 real_click(page, btn)
                 played_key, played_at = key, time.time()
+                tries[key] = tries.get(key, 0) + 1
+                if tries[key] == 3 and "noeffect" not in diag_sent:
+                    diag_sent.add("noeffect")
+                    diag(page, game, seat, turn, col, "clicked this column 3 times but the position never changed")
+            elif "nobtn" not in diag_sent:
+                diag_sent.add("nobtn")
+                diag(page, game, seat, turn, col, "column button missing or disabled on our turn")
         except Exception as e:
             print("click failed:", type(e).__name__, flush=True)
+            if "exc" not in diag_sent:
+                diag_sent.add("exc")
+                diag(page, game, seat, turn, col, f"click raised {type(e).__name__}: {str(e)[:150]}")
         page.wait_for_timeout(150)
 
 
