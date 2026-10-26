@@ -1,7 +1,5 @@
 {
   "enabled": true,
-  "debug": 0,
-  "click_mode": "fast",
   "stake": "1000",
   "seat": "auto",
   "max_loss": 0,
@@ -20,5 +18,9 @@
     30,
     60
   ],
-  "cf_give_up_min": 300
+  "cf_give_up_min": 300,
+  "debug": 0,
+  "click_mode": "fast",
+  "retry_ms": 1500,
+  "human_steps": 3
 }
