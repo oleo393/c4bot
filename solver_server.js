@@ -28,14 +28,15 @@ function load(name, fn) {
 load("book.json", C.loadBook);
 load("book_12ply_distances.dat", C.loadDatBook);
 load("book_8ply.dat", C.loadDat8Book);
-out({ ready: true, books });
+out({ ready: true, books, node: process.version });
 
 let current = 0;
 readline.createInterface({ input: process.stdin }).on("line", (line) => {
   let m; try { m = JSON.parse(line); } catch (_) { return; }
   if (!m || !Array.isArray(m.cols)) return;
   const id = m.id; current = id;
-  const s = C.session(m.cols, (r) => { if (current === id) out(Object.assign({ id }, r)); }, { totalMs });
+  const t0 = performance.now();   // _t = ms since this request was read (solver compute time as seen by node)
+  const s = C.session(m.cols, (r) => { if (current === id) out(Object.assign({ id, _t: Math.round(performance.now() - t0) }, r)); }, { totalMs });
   if (!s) { out({ id, error: "invalid position" }); return; }
   const tick = () => {
     if (current !== id) return;
