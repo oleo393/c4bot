@@ -1,5 +1,6 @@
 {
   "enabled": true,
+  "debug": 0,
   "stake": "1000",
   "seat": "auto",
   "max_loss": 0,
