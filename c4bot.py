@@ -50,6 +50,7 @@ DEFAULT_CFG = {
     "min_delay_ms": 400,        # wait this long after a new position before clicking
     "cf_retry_minutes": [3, 5, 10, 20, 30, 60],  # waits between retries when Cloudflare blocks (last value repeats)
     "cf_give_up_min": 300,      # stop after being blocked this long in a row (the next hourly run tries again)
+    "debug": 0,                 # 0 = off, 1 = timing log sent to the private Discord webhook after each game, 2 = also print to stdout
 }
 
 END_BUFFER_S = 5
@@ -142,6 +143,107 @@ def notify(msg, screenshot=None):
         print("Discord send failed:", e)
 
 
+# ---------------------------------------------------------------- debug log (opt-in: "debug" in the private config.json)
+# "debug": 1 -> buffer everything and upload it to the PRIVATE Discord webhook as c4-debug.txt after each game
+# "debug": 2 -> additionally print the non-private lines to stdout (a PUBLIC repo's Actions log is public!)
+# Takes effect live (config.json is re-read between games and every 20 s during a game). Env C4_DEBUG / --debug also force it on.
+# Never logged: game id, stake, balance, player id. "private" lines (winner/result/move list) never go to stdout.
+_ENV_DEBUG = os.environ.get("C4_DEBUG", "").strip()
+DEBUG = bool(_ENV_DEBUG) or "--debug" in sys.argv
+DEBUG_STDOUT = _ENV_DEBUG == "2"
+
+
+def set_debug(cfg):
+    global DEBUG, DEBUG_STDOUT
+    try:
+        lvl = int(cfg.get("debug") or 0)
+    except (TypeError, ValueError):
+        lvl = 0
+    if _ENV_DEBUG or "--debug" in sys.argv:
+        lvl = max(lvl, int(_ENV_DEBUG) if _ENV_DEBUG.isdigit() else 1)
+    DEBUG, DEBUG_STDOUT = lvl > 0, lvl >= 2
+_DBG_T0 = time.monotonic()
+_DBG_BUF = []
+
+
+def _f(x, nd=2):
+    return "None" if x is None else f"{x:.{nd}f}"
+
+
+def dlog(tag, _priv=False, **kv):
+    if not DEBUG:
+        return
+    line = f"[{time.monotonic() - _DBG_T0:9.3f}] {tag:<9} " + " ".join(f"{k}={v}" for k, v in kv.items())
+    _DBG_BUF.append((line, _priv))
+    if len(_DBG_BUF) > 30000:
+        del _DBG_BUF[:5000]
+    if DEBUG_STDOUT and not _priv:
+        print("[dbg] " + line, flush=True)
+
+
+def dflush(label):
+    if not DEBUG or not _DBG_BUF:
+        return
+    lines = list(_DBG_BUF)
+    _DBG_BUF.clear()
+    text = "\n".join(ln for ln, _ in lines) + "\n"
+    try:
+        with open(HERE / "c4-debug.log", "a", encoding="utf-8") as fh:
+            fh.write(text)
+    except Exception:
+        pass
+    ok = False
+    if WEBHOOK:
+        try:
+            payload = {"content": f"\U0001F41E debug log ({label}) \u00b7 {now_str()}", "allowed_mentions": {"parse": []}}
+            r = requests.post(WEBHOOK, data={"payload_json": json.dumps(payload)},
+                              files={"file": ("c4-debug.txt", text.encode("utf-8"), "text/plain")}, timeout=30)
+            ok = r.ok
+            if not ok:
+                print("debug upload failed:", r.status_code, flush=True)
+        except Exception as e:
+            print("debug upload failed:", type(e).__name__, flush=True)
+    if not ok and not DEBUG_STDOUT:   # no webhook / upload failed: fall back to stdout (non-private lines only)
+        print("[dbg] ---- debug log (" + label + ") ----", flush=True)
+        print("\n".join(ln for ln, priv in lines if not priv), flush=True)
+
+
+def sc_str(scores):
+    return "[" + ",".join("-" if v is None else str(v) for v in scores) + "]"
+
+
+def sol_sum(sol):
+    if not sol:
+        return "none"
+    keys = ("depth", "stage", "final", "exact", "bestProven", "best", "outcome", "exactTimeout", "weak", "book", "_t")
+    out = ",".join(f"{k}={sol[k]}" for k in keys if k in sol)
+    if sol.get("scores"):
+        out += " scores=" + sc_str(sol["scores"])
+    return out
+
+
+def dom_probe(page):
+    """(on-screen turn timer text, round-trip ms of one trivial page.evaluate = browser-control latency)"""
+    t = time.monotonic()
+    try:
+        txt = page.evaluate("() => { const t = document.querySelector('[class*=\"_turnTime\"]'); return t ? t.textContent : null; }")
+    except Exception as e:
+        txt = "err:" + type(e).__name__
+    return txt, (time.monotonic() - t) * 1000
+
+
+def dbg_end(game, seat, sol, why):
+    if not DEBUG:
+        return
+    mv = sorted(game.get("moves") or [], key=lambda m: m.get("seq", 0))
+    dlog("GAMEEND", why=why, moves=len(mv),
+         my_auto_moves=sum(1 for m in mv if m.get("auto") and m.get("seat") == seat),
+         opp_auto_moves=sum(1 for m in mv if m.get("auto") and m.get("seat") != seat),
+         timeouts=game.get("timeouts"), solver_over=sol.get("over") if sol else None)
+    dlog("GAMEEND+", _priv=True, status=game.get("status"), winner=game.get("winner"), result=game.get("result"),
+         seat=seat, seq="".join(str(m["column"] + 1) for m in mv))
+
+
 def shot(page):
     try:
         return page.screenshot()
@@ -149,16 +251,25 @@ def shot(page):
         return None
 
 
-def real_click(page, locator):
+def real_click(page, locator, tm=None):
+    t0 = time.monotonic()
     locator.scroll_into_view_if_needed(timeout=10000)
+    t1 = time.monotonic()
     box = locator.bounding_box()
     if not box:
         raise BotError("Element has no bounding box", shot(page))
+    t2 = time.monotonic()
     x = box["x"] + box["width"] * random.uniform(0.35, 0.65)
     y = box["y"] + box["height"] * random.uniform(0.35, 0.65)
-    page.mouse.move(x, y, steps=random.randint(8, 20))
-    page.wait_for_timeout(random.randint(80, 250))
+    steps, pause = random.randint(8, 20), random.randint(80, 250)
+    page.mouse.move(x, y, steps=steps)
+    t3 = time.monotonic()
+    page.wait_for_timeout(pause)
+    t4 = time.monotonic()
     page.mouse.click(x, y)
+    if tm is not None:
+        tm.update(scroll_ms=round((t1 - t0) * 1000), bbox_ms=round((t2 - t1) * 1000), move_ms=round((t3 - t2) * 1000),
+                  move_steps=steps, pause_ms=round((t4 - t3) * 1000), click_ms=round((time.monotonic() - t4) * 1000))
 
 
 # ---------------------------------------------------------------- live config (the control surface)
@@ -284,6 +395,8 @@ def save_state(ctx):
 class Solver:
     def __init__(self):
         self.res, self.next_id, self.books = {}, 0, {}
+        self.req_t = {}
+        self._t_init = time.monotonic()
         self.ready = threading.Event()
         self.lock = threading.Lock()
         self.p = subprocess.Popen(["node", str(HERE / "solver_server.js"), BOOKS_DIR, "24", "7000"],
@@ -292,6 +405,7 @@ class Solver:
         threading.Thread(target=self._read, daemon=True).start()
         if not self.ready.wait(180):
             raise RuntimeError("solver did not start")
+        dlog("SOLVERUP", startup_s=_f(time.monotonic() - self._t_init), books=self.books)
 
     def _read(self):
         for line in self.p.stdout:
@@ -303,11 +417,20 @@ class Solver:
                 self.books = m.get("books", {})
                 self.ready.set()
                 continue
+            if DEBUG:
+                rt = self.req_t.get(m.get("id"))
+                dlog("SOLVER", id=m.get("id"), since_req_ms=f"{(time.monotonic() - rt) * 1000:.0f}" if rt else "?",
+                     node_ms=m.get("_t"), **{k: m[k] for k in ("depth", "stage", "final", "exact", "bestProven", "best", "outcome",
+                                                              "exactTimeout", "weak", "book", "over", "draw", "error", "exactSkipped")
+                                             if k in m},
+                     scores=sc_str(m["scores"]) if m.get("scores") else None)
             with self.lock:
                 self.res.setdefault(m.get("id"), {}).update(m)
 
     def request(self, cols):
         self.next_id += 1
+        self.req_t[self.next_id] = time.monotonic()
+        dlog("REQ", id=self.next_id, n=len(cols))
         self.p.stdin.write(json.dumps({"id": self.next_id, "cols": cols}) + "\n")
         self.p.stdin.flush()
         return self.next_id
@@ -375,6 +498,7 @@ class Session:
         self.browser = p.chromium.launch(channel="chrome", headless=HEADLESS,
                                          ignore_default_args=["--enable-automation"],
                                          args=["--disable-blink-features=AutomationControlled"])
+        dlog("BROWSER", version=self.browser.version, headless=HEADLESS)
         try:
             self.ctx = self.browser.new_context(storage_state=str(STATE_FILE),
                                                 viewport={"width": 1366, "height": 800})
@@ -392,7 +516,7 @@ class Session:
             if resp.request.method == "GET" and resp.ok and "api.donutflip.net" in resp.url:
                 m = GAME_RE.search(resp.url)
                 if m:
-                    self.q.append((m.group(1), resp))
+                    self.q.append((m.group(1), resp, time.time()))
         except Exception:
             pass
 
@@ -630,16 +754,6 @@ def close_session(sess):
     sess.close()
 
 
-def waiting_banner(page):
-    try:
-        return bool(page.evaluate(r"""() => {
-            const e = document.querySelector('[class*="_turn"][data-tone]');
-            return !!e && /WAITINGFORANOPPONENT/.test(e.innerText.replace(/[\s\u00a0]+/g, '').toUpperCase());
-        }"""))
-    except Exception:
-        return False
-
-
 def diag(page, game, seat, turn, col, why):
     """One-off diagnostic. Goes to the private Discord webhook only (never the public Actions log)."""
     try:
@@ -681,17 +795,26 @@ def play_game(sess, solver, wait_s):
     req = None
     over_since = None
     joined_at = None
-    cfg, cfg_at = get_cfg(), time.monotonic()
+    cfg, cfg_at = get_cfg(), time.monotonic(); set_debug(cfg)
     diag_sent, tries = set(), {}
+    last_iter, last_wait, last_click_done, late_key = time.monotonic(), 0.0, 0.0, None
+    dlog("GAMESTART", note="waiting for opponent")
 
     while True:
+        if DEBUG:
+            _now = time.monotonic()
+            if _now - last_iter > 0.5:
+                dlog("LOOPLAG", gap_ms=round((_now - last_iter) * 1000), load=os.getloadavg()[0])
+            last_iter = _now
         if time.monotonic() - cfg_at > 20:
-            cfg, cfg_at = get_cfg(), time.monotonic()
+            cfg, cfg_at = get_cfg(), time.monotonic(); set_debug(cfg)
         while q:
-            rgid, resp = q.popleft()
+            rgid, resp, arr = q.popleft()
+            tj = time.monotonic()
             try:
                 g = extract_game(resp.json())
-            except Exception:
+            except Exception as e:
+                dlog("JSONFAIL", err=type(e).__name__)
                 continue
             if not g:
                 continue
@@ -708,8 +831,28 @@ def play_game(sess, solver, wait_s):
             moves = sorted(g["moves"], key=lambda m: m.get("seq", 0))
             cols = [m["column"] for m in moves]
             k = gid + ":" + "".join(map(str, cols))
+            if DEBUG:
+                te_, sn_ = g.get("turnEndsAt"), g.get("serverNow")
+                try:
+                    span = (float(te_) - float(sn_)) / 1000
+                    rem_arr = span - (time.time() - arr)
+                    skew = float(sn_) - arr * 1000   # server clock minus ours at arrival (ms); big = clock offset
+                except (TypeError, ValueError):
+                    span = rem_arr = skew = None
+                dlog("API", n=len(moves), new=int(k != key), turn=g.get("turn"), status=g.get("status"),
+                     te_type=type(te_).__name__, sn_type=type(sn_).__name__, te_minus_sn_s=_f(span), rem_at_arrival_s=_f(rem_arr),
+                     skew_ms=_f(skew, 0), proc_lag_ms=f"{(time.time() - arr) * 1000:.0f}", json_ms=f"{(time.monotonic() - tj) * 1000:.0f}")
             if k != key:
                 key, seen_at, over_since = k, time.time(), None
+                if DEBUG:
+                    last = moves[-1] if moves else {}
+                    dlog("NEWPOS", n=len(moves), last=f"{(last.get('seat') or '?')[:1].upper()}{last.get('column', -2) + 1}",
+                         last_auto=int(bool(last.get("auto"))), seat=seat, timeouts=g.get("timeouts"))
+                    if last.get("auto"):
+                        dlog("AUTOMOVE", note="last move was auto-played by the site (turn timeout)", seat_of_move=last.get("seat"), mine=int(last.get("seat") == seat))
+                    if last_click_done and last.get("seat") == seat:
+                        dlog("ACK", own_move_visible_in_api_after_ms=round((time.monotonic() - last_click_done) * 1000))
+                        last_click_done = 0.0
                 req = solver.request(cols) if cols else None
             if g.get("opponentId") or moves:
                 joined_at = joined_at or time.monotonic()
@@ -728,10 +871,12 @@ def play_game(sess, solver, wait_s):
 
         if is_done(game):
             sess.listing = None
+            dbg_end(game, seat, sol, "api-done")
             return game, seat, sol
         if sol.get("over"):
             over_since = over_since or time.monotonic()
             if time.monotonic() - over_since > 15:   # API never showed a final state: settle from the board
+                dbg_end(game, seat, sol, "settled-from-board")
                 return game, seat, sol
             page.wait_for_timeout(250)
             continue
@@ -772,6 +917,9 @@ def play_game(sess, solver, wait_s):
         except (TypeError, ValueError):
             rem = None
         late = rem <= cfg["safe_remaining_s"] if rem is not None else (time.time() - seen_at) > 4
+        if DEBUG and late and late_key != key:
+            late_key = key
+            dlog("LATE", rem_s=_f(rem), rem_is_none=int(rem is None), since_seen_ms=round((time.time() - seen_at) * 1000), sol=sol_sum(sol))
 
         col, ready = -1, False
         if n == 0:
@@ -783,32 +931,44 @@ def play_game(sess, solver, wait_s):
             col = b if isinstance(b, int) and b >= 0 else best_col(sol["scores"])
             ready = bool(sol.get("exact") or sol.get("final") or sol.get("bestProven"))
         if not ready and not late:
+            if DEBUG and time.monotonic() - last_wait > 1.0:
+                last_wait = time.monotonic()
+                dlog("WAIT", n=n, rem_s=_f(rem), since_seen_ms=round((time.time() - seen_at) * 1000), sol=sol_sum(sol))
             page.wait_for_timeout(100)
             continue
+        fallback = False
         if col < 0 or col not in legal:
             if not late:
                 page.wait_for_timeout(100)
                 continue
-            col = legal[0]
+            col, fallback = legal[0], True
 
+        t_dec = time.monotonic()
+        if DEBUG:
+            why = ("opening" if n == 0 else "forced" if len(legal) == 1 else "LATE-NO-SOLUTION-FALLBACK" if fallback
+                   else "proven" if ready else "LATE-UNPROVEN-BEST-SO-FAR")
+            dom_txt, cdp_rtt = dom_probe(page)
+            dlog("DECIDE", why=why, col=col + 1, n=n, legal=[c + 1 for c in legal], rem_s=_f(rem), dom_timer=repr(dom_txt),
+                 cdp_rtt_ms=round(cdp_rtt), since_seen_ms=round((time.time() - seen_at) * 1000),
+                 load=os.getloadavg()[0], sol=sol_sum(sol))
         btn = page.locator(f'button[aria-label="Drop a disc in column {col + 1}"]').first
         try:
             if btn.count() and btn.is_enabled():
-                real_click(page, btn)
-                tries.pop("_nb", None)
+                tm = {} if DEBUG else None
+                real_click(page, btn, tm)
                 played_key, played_at = key, time.time()
+                last_click_done = time.monotonic()
+                if DEBUG:
+                    dlog("CLICK", col=col + 1, decide_to_done_ms=round((last_click_done - t_dec) * 1000), **tm,
+                         rem_after_s=_f(None if rem is None else rem - (last_click_done - t_dec)), try_no=tries.get(key, 0) + 1)
                 tries[key] = tries.get(key, 0) + 1
                 if tries[key] == 3 and "noeffect" not in diag_sent:
                     diag_sent.add("noeffect")
                     diag(page, game, seat, turn, col, "clicked this column 3 times but the position never changed")
-            elif waiting_banner(page):
-                tries.pop("_nb", None)        # nobody has joined yet: disabled buttons are expected
-                page.wait_for_timeout(500)
-            else:
-                tries.setdefault("_nb", time.monotonic())
-                if time.monotonic() - tries["_nb"] > 8 and "nobtn" not in diag_sent:
-                    diag_sent.add("nobtn")
-                    diag(page, game, seat, turn, col, "opponent present but column button still missing/disabled after 8s")
+            elif "nobtn" not in diag_sent:
+                dlog("NOBTN", col=col + 1, count=btn.count())
+                diag_sent.add("nobtn")
+                diag(page, game, seat, turn, col, "column button missing or disabled on our turn")
         except Exception as e:
             print("click failed:", type(e).__name__, flush=True)
             if "exc" not in diag_sent:
@@ -835,6 +995,7 @@ def main():
     stats.pop("dead_hash", None)
 
     cfg = get_cfg()
+    set_debug(cfg)
     if not cfg["enabled"]:
         print("Disabled in config.json. Exiting.")
         return 0
@@ -843,6 +1004,13 @@ def main():
         print("Max loss already reached (change reset_pnl_token or max_loss to continue). Exiting.")
         return 0
     solver = Solver()
+    if DEBUG:
+        try:
+            node_v = subprocess.run(["node", "-v"], capture_output=True, text=True, timeout=10).stdout.strip()
+        except Exception:
+            node_v = "?"
+        dlog("ENV", python=sys.version.split()[0], node=node_v, cpus=os.cpu_count(), load=os.getloadavg(), actions=int(IN_ACTIONS),
+             safe_remaining_s=cfg["safe_remaining_s"], min_delay_ms=cfg["min_delay_ms"], solver_total_ms=7000, tt_bits=24)
     notify(f"▶️ Connect 4 bot started · {now_str()}\nBooks: {solver.books}\n"
            f"Stake {fmt(parse_amount(cfg['stake']))} · seat {cfg['seat']} · P/L so far {fmt_signed(stats['pnl'])}")
     games = errors = 0
@@ -868,6 +1036,7 @@ def main():
         with sync_playwright() as p:
             while True:
                 cfg = get_cfg()
+                set_debug(cfg)
                 if cfg.get("reset_pnl_token") != stats.get("reset_token"):
                     stats["pnl"], stats["rec"], stats["reset_token"] = 0, {"w": 0, "l": 0, "d": 0, "v": 0, "u": 0}, cfg.get("reset_pnl_token")
                 stake = parse_amount(cfg["stake"])
@@ -896,6 +1065,7 @@ def main():
 
                     create_game(sess, stake)
                     result = play_game(sess, solver, float(cfg["opponent_wait_s"]))
+                    dflush(f"after game {games + 1}")
                     if result is None:
                         ok = cancel_listing(sess)      # never leave an unjoined listing behind
                         notify("⌛ Stopped waiting for an opponent · " +
@@ -983,6 +1153,7 @@ def main():
             sess.close()
         save_stats(stats)
         solver.close()
+        dflush("exit")
         notify(f"⏹️ Connect 4 bot {reason} · games this run: {games} · P/L {fmt_signed(stats['pnl'])}")
     return exit_code
 
