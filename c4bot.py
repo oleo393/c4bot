@@ -50,6 +50,8 @@ DEFAULT_CFG = {
     "min_delay_ms": 400,        # wait this long after a new position before clicking
     "cf_retry_minutes": [3, 5, 10, 20, 30, 60],  # waits between retries when Cloudflare blocks (last value repeats)
     "cf_give_up_min": 300,      # stop after being blocked this long in a row (the next hourly run tries again)
+    "retry_ms": 1500,           # re-click if the position has not changed this long after a click (fast and human attempts alternate)
+    "human_steps": 3,           # mouse-move steps of the human click (each step costs ~0.25 s on a busy runner)
     "click_mode": "fast",       # "fast" = one in-page click (like the old extension), "human" = scroll + mouse path (slow: ~0.25 s per mouse step on the runner)
     "debug": 0,                 # 0 = off, 1 = timing log sent to the private Discord webhook after each game, 2 = also print to stdout
 }
@@ -245,6 +247,10 @@ def dbg_end(game, seat, sol, why):
          seat=seat, seq="".join(str(m["column"] + 1) for m in mv))
 
 
+def notify_bg(msg, screenshot=None):
+    threading.Thread(target=notify, args=(msg, screenshot), daemon=True).start()
+
+
 def shot(page):
     try:
         return page.screenshot()
@@ -252,25 +258,64 @@ def shot(page):
         return None
 
 
-def real_click(page, locator, tm=None):
+def real_click(page, locator, tm=None, quick=False, steps=3):
+    """Human-like click. quick=True (used for moves): no actionability waits, one plain evaluate for the box,
+    only scroll when the button is off-screen, few mouse steps, no pause."""
     t0 = time.monotonic()
-    locator.scroll_into_view_if_needed(timeout=10000)
-    t1 = time.monotonic()
-    box = locator.bounding_box()
+    if quick:
+        r = locator.evaluate("e => { const b = e.getBoundingClientRect(); return [b.x, b.y, b.width, b.height, innerWidth, innerHeight]; }",
+                             timeout=2000)
+        box = {"x": r[0], "y": r[1], "width": r[2], "height": r[3]}
+        if not (box["width"] > 0 and box["height"] > 0 and box["x"] >= 0 and box["y"] >= 0
+                and box["x"] + box["width"] <= r[4] and box["y"] + box["height"] <= r[5]):
+            locator.scroll_into_view_if_needed(timeout=3000)
+            box = locator.bounding_box()
+        t1 = t2 = time.monotonic()
+        nsteps, pause = max(1, int(steps)), 0
+    else:
+        locator.scroll_into_view_if_needed(timeout=10000)
+        t1 = time.monotonic()
+        box = locator.bounding_box()
+        t2 = time.monotonic()
+        nsteps, pause = random.randint(8, 20), random.randint(80, 250)
     if not box:
         raise BotError("Element has no bounding box", shot(page))
-    t2 = time.monotonic()
     x = box["x"] + box["width"] * random.uniform(0.35, 0.65)
     y = box["y"] + box["height"] * random.uniform(0.35, 0.65)
-    steps, pause = random.randint(8, 20), random.randint(80, 250)
-    page.mouse.move(x, y, steps=steps)
+    page.mouse.move(x, y, steps=nsteps)
     t3 = time.monotonic()
-    page.wait_for_timeout(pause)
+    if pause:
+        page.wait_for_timeout(pause)
     t4 = time.monotonic()
     page.mouse.click(x, y)
     if tm is not None:
         tm.update(scroll_ms=round((t1 - t0) * 1000), bbox_ms=round((t2 - t1) * 1000), move_ms=round((t3 - t2) * 1000),
-                  move_steps=steps, pause_ms=round((t4 - t3) * 1000), click_ms=round((time.monotonic() - t4) * 1000))
+                  move_steps=nsteps, pause_ms=round((t4 - t3) * 1000), click_ms=round((time.monotonic() - t4) * 1000))
+
+
+def attempt_click(page, col, cfg, attempt, tm=None):
+    """One click attempt on a column button -> 'ok' | 'disabled' | 'missing'. Never blocks for long.
+    Attempts alternate: 0 = fast in-page click, 1 = quick human click, 2 = fast, ... (click_mode 'human' = always human)."""
+    btn = page.locator(f'button[aria-label="Drop a disc in column {col + 1}"]').first
+    fast = str(cfg.get("click_mode", "fast")).lower() != "human" and attempt % 2 == 0
+    if fast:
+        try:   # one browser round-trip, same as the old extension's btn.click()
+            res = btn.evaluate("e => { if (e.disabled) return 'disabled'; e.click(); return 'ok'; }", timeout=1000)
+        except Exception as e:
+            res = "missing" if "Timeout" in type(e).__name__ else "err:" + type(e).__name__
+        if tm is not None:
+            tm.update(mode="fast", res=res)
+        if res in ("ok", "disabled", "missing"):
+            return res
+        # unexpected error: fall through to the human path
+    if not btn.count():
+        return "missing"
+    if not btn.is_enabled():
+        return "disabled"
+    if tm is not None:
+        tm.update(mode="human", res="ok")
+    real_click(page, btn, tm, quick=True, steps=cfg.get("human_steps", 3))
+    return "ok"
 
 
 # ---------------------------------------------------------------- live config (the control surface)
@@ -778,7 +823,7 @@ def diag(page, game, seat, turn, col, why):
         info = {"evaluate_error": type(e).__name__}
     g = game or {}
     mv = g.get("moves") or [{}]
-    notify(f"\U0001F50D Bot diagnostic: {why}\n"
+    notify_bg(f"\U0001F50D Bot diagnostic: {why}\n"
            f"seat={seat} turn_calc={turn} api_turn={g.get('turn')!r} viewer={g.get('viewer')!r} "
            f"moves={len(g.get('moves') or [])} status={g.get('status')!r}\n"
            f"api_keys={sorted(g.keys())}\nmove_keys={sorted(mv[0].keys())}\npage={info}", shot(page))
@@ -799,6 +844,7 @@ def play_game(sess, solver, wait_s):
     cfg, cfg_at = get_cfg(), time.monotonic(); set_debug(cfg)
     diag_sent, tries = set(), {}
     last_iter, last_wait, last_click_done, late_key = time.monotonic(), 0.0, 0.0, None
+    nobtn, last_nobtn_log = None, 0.0   # (position key, first time the button was missing/disabled)
     dlog("GAMESTART", note="waiting for opponent")
 
     while True:
@@ -899,7 +945,7 @@ def play_game(sess, solver, wait_s):
         if turn != seat or (time.time() - seen_at) * 1000 < cfg["min_delay_ms"]:
             page.wait_for_timeout(150)
             continue
-        if played_key == key and time.time() - played_at < 2.5:
+        if played_key == key and time.time() - played_at < float(cfg.get("retry_ms", 1500)) / 1000:
             page.wait_for_timeout(150)
             continue
 
@@ -952,20 +998,13 @@ def play_game(sess, solver, wait_s):
             dlog("DECIDE", why=why, col=col + 1, n=n, legal=[c + 1 for c in legal], rem_s=_f(rem), dom_timer=repr(dom_txt),
                  cdp_rtt_ms=round(cdp_rtt), since_seen_ms=round((time.time() - seen_at) * 1000),
                  load=os.getloadavg()[0], sol=sol_sum(sol))
-        btn = page.locator(f'button[aria-label="Drop a disc in column {col + 1}"]').first
         try:
-            res = None
-            if str(cfg.get("click_mode", "fast")).lower() != "human" and tries.get(key, 0) == 0:
-                try:   # single browser round-trip; a retry (tries > 0) always uses the human path below
-                    res = btn.evaluate("e => { if (e.disabled) return 'disabled'; e.click(); return 'ok'; }", timeout=1500)
-                except Exception as e:
-                    res = "err:" + type(e).__name__
-            tm = {"mode": "fast" if res == "ok" else "human", "fast_res": res} if DEBUG else None
-            if res == "ok" or (btn.count() and btn.is_enabled()):
-                if res != "ok":
-                    real_click(page, btn, tm)
+            tm = {} if DEBUG else None
+            status = attempt_click(page, col, cfg, tries.get(key, 0), tm)
+            if status == "ok":
                 played_key, played_at = key, time.time()
                 last_click_done = time.monotonic()
+                nobtn = None
                 if DEBUG:
                     dlog("CLICK", col=col + 1, decide_to_done_ms=round((last_click_done - t_dec) * 1000), **tm,
                          rem_after_s=_f(None if rem is None else rem - (last_click_done - t_dec)), try_no=tries.get(key, 0) + 1)
@@ -973,12 +1012,20 @@ def play_game(sess, solver, wait_s):
                 if tries[key] == 3 and "noeffect" not in diag_sent:
                     diag_sent.add("noeffect")
                     diag(page, game, seat, turn, col, "clicked this column 3 times but the position never changed")
-            elif "nobtn" not in diag_sent:
-                dlog("NOBTN", col=col + 1, count=btn.count())
-                diag_sent.add("nobtn")
-                diag(page, game, seat, turn, col, "column button missing or disabled on our turn")
+            else:
+                # button missing or disabled (e.g. the start countdown): keep polling and clicking, never block
+                now_m = time.monotonic()
+                if nobtn is None or nobtn[0] != key:
+                    nobtn = (key, now_m)
+                if DEBUG and now_m - last_nobtn_log > 1.0:
+                    last_nobtn_log = now_m
+                    dlog("NOBTN", col=col + 1, status=status, waited_ms=round((now_m - nobtn[1]) * 1000), rem_s=_f(rem))
+                if now_m - nobtn[1] > 8 and "nobtn" not in diag_sent:   # only report it if it persists
+                    diag_sent.add("nobtn")
+                    diag(page, game, seat, turn, col, "column button missing or disabled on our turn for 8+ s")
         except Exception as e:
             print("click failed:", type(e).__name__, flush=True)
+            dlog("CLICKERR", err=type(e).__name__, msg=str(e)[:120].replace("\n", " "))
             if "exc" not in diag_sent:
                 diag_sent.add("exc")
                 diag(page, game, seat, turn, col, f"click raised {type(e).__name__}: {str(e)[:150]}")
