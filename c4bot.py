@@ -50,6 +50,7 @@ DEFAULT_CFG = {
     "min_delay_ms": 400,        # wait this long after a new position before clicking
     "cf_retry_minutes": [3, 5, 10, 20, 30, 60],  # waits between retries when Cloudflare blocks (last value repeats)
     "cf_give_up_min": 300,      # stop after being blocked this long in a row (the next hourly run tries again)
+    "click_mode": "fast",       # "fast" = one in-page click (like the old extension), "human" = scroll + mouse path (slow: ~0.25 s per mouse step on the runner)
     "debug": 0,                 # 0 = off, 1 = timing log sent to the private Discord webhook after each game, 2 = also print to stdout
 }
 
@@ -953,9 +954,16 @@ def play_game(sess, solver, wait_s):
                  load=os.getloadavg()[0], sol=sol_sum(sol))
         btn = page.locator(f'button[aria-label="Drop a disc in column {col + 1}"]').first
         try:
-            if btn.count() and btn.is_enabled():
-                tm = {} if DEBUG else None
-                real_click(page, btn, tm)
+            res = None
+            if str(cfg.get("click_mode", "fast")).lower() != "human" and tries.get(key, 0) == 0:
+                try:   # single browser round-trip; a retry (tries > 0) always uses the human path below
+                    res = btn.evaluate("e => { if (e.disabled) return 'disabled'; e.click(); return 'ok'; }", timeout=1500)
+                except Exception as e:
+                    res = "err:" + type(e).__name__
+            tm = {"mode": "fast" if res == "ok" else "human", "fast_res": res} if DEBUG else None
+            if res == "ok" or (btn.count() and btn.is_enabled()):
+                if res != "ok":
+                    real_click(page, btn, tm)
                 played_key, played_at = key, time.time()
                 last_click_done = time.monotonic()
                 if DEBUG:
