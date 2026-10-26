@@ -3,28 +3,32 @@ name: connect4-bot
 on:
   workflow_dispatch:        # "Run workflow" button (collaborators only)
   schedule:
-    - cron: "7 * * * *"     # hourly; exits quietly if enabled=false in the private config
+    - cron: "7 * * * *"     # hourly; each account exits quietly if enabled=false in its private config
 
 permissions:
-  contents: write           # only used by the keep-alive step below
-
-concurrency:
-  group: connect4-bot       # one run at a time; a queued run starts when the previous ends
-  cancel-in-progress: false
+  contents: read
 
 jobs:
   play:
     if: github.repository_owner == github.actor || github.event_name == 'schedule'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest          # one fresh 4 vCPU / 16 GB VM per account
     timeout-minutes: 355
+    strategy:
+      fail-fast: false              # one account failing never stops the others
+      matrix:
+        account: [main, alt, mmain, malt]
+    concurrency:
+      group: connect4-${{ matrix.account }}   # one run per account; a queued run starts when the previous ends
+      cancel-in-progress: false
     env:
       STATE_KEY: ${{ secrets.STATE_KEY }}
-      STATE_JSON: ${{ secrets.STATE_JSON }}
-      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
       C4_DATA_REPO: ${{ secrets.C4_DATA_REPO }}
       C4_DATA_TOKEN: ${{ secrets.C4_DATA_TOKEN }}
-      C4_PLAYER_ID: ${{ secrets.C4_PLAYER_ID }}
+      C4_ACCOUNT: ${{ matrix.account }}
+      C4_DATA_PREFIX: accounts/${{ matrix.account }}
       C4_MAX_RUNTIME_MIN: "335"
+      # Webhook + player_id come from accounts/<name>/config.json in the private repo.
+      # Do NOT set C4_PLAYER_ID / DISCORD_WEBHOOK_URL here: they would apply to every account.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -34,11 +38,3 @@ jobs:
       - run: pip install -r requirements.txt
       - name: Run bot
         run: python c4bot.py
-      - name: Keep scheduled runs alive (public repos pause them after 60 days without commits)
-        if: always()
-        run: |
-          last=$(git log -1 --format=%ct); now=$(date +%s)
-          if [ $(( (now - last) / 86400 )) -ge 30 ]; then
-            git config user.name "c4bot"; git config user.email "c4bot@users.noreply.github.com"
-            git commit --allow-empty -m "keepalive" && git push
-          fi

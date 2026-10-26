@@ -1,0 +1,42 @@
+name: daily-summary
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Send the report now (for yesterday), ignoring the once-a-day guard"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "17 * * * *"    # hourly check; summary.py sends only once per day (see summary.json)
+
+permissions:
+  contents: write           # only for the keep-alive step below
+
+concurrency:
+  group: daily-summary
+  cancel-in-progress: false
+
+jobs:
+  summary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      STATE_KEY: ${{ secrets.STATE_KEY }}
+      C4_DATA_REPO: ${{ secrets.C4_DATA_REPO }}
+      C4_DATA_TOKEN: ${{ secrets.C4_DATA_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install requests cryptography
+      - name: Send report
+        run: python summary.py ${{ inputs.force && '--force' || '' }}
+      - name: Keep scheduled runs alive (public repos pause them after 60 days without commits)
+        if: always()
+        run: |
+          last=$(git log -1 --format=%ct); now=$(date +%s)
+          if [ $(( (now - last) / 86400 )) -ge 30 ]; then
+            git config user.name "c4bot"; git config user.email "c4bot@users.noreply.github.com"
+            git commit --allow-empty -m "keepalive" && git push
+          fi

@@ -7,7 +7,7 @@ Solver: solver.js driven through solver_server.js (Node).
 """
 import base64, hashlib, json, os, random, re, signal, subprocess, sys, threading, time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -24,7 +24,9 @@ HEADLESS = "--headed" not in sys.argv
 LOBBY_URL = "https://donutflip.net/connect-four"
 HOME_URL = "https://donutflip.net/"
 
-STORE = Store()
+STORE = Store()   # reads C4_DATA_REPO / C4_DATA_TOKEN / C4_DATA_PREFIX (e.g. accounts/alt)
+ACCOUNT = os.environ.get("C4_ACCOUNT", "").strip()
+LABEL = f"[{ACCOUNT}] " if ACCOUNT else ""
 IN_ACTIONS = bool(os.environ.get("GITHUB_ACTIONS"))
 CONFIG_FILE = HERE / "config.json"         # local-dev fallback (gitignored)
 STATE_ENC = HERE / "state.enc"             # local-dev fallback (gitignored)
@@ -53,6 +55,7 @@ DEFAULT_CFG = {
     "retry_ms": 1500,           # re-click if the position has not changed this long after a click (fast and human attempts alternate)
     "human_steps": 3,           # mouse-move steps of the human click (each step costs ~0.25 s on a busy runner)
     "click_mode": "fast",       # "fast" = one in-page click (like the old extension), "human" = scroll + mouse path (slow: ~0.25 s per mouse step on the runner)
+    "webhook": "",              # this account's Discord webhook (private repo only); falls back to the DISCORD_WEBHOOK_URL env / .secret
     "debug": 0,                 # 0 = off, 1 = timing log sent to the private Discord webhook after each game, 2 = also print to stdout
 }
 
@@ -325,7 +328,7 @@ _cfg_warned = False
 
 def get_cfg():
     """config.json from the private data repo (edits apply live), else the local file."""
-    global _last_cfg, _cfg_warned
+    global _last_cfg, _cfg_warned, WEBHOOK
     raw = None
     if STORE.enabled:
         try:
@@ -346,6 +349,9 @@ def get_cfg():
             if parse_amount(cfg["stake"]) in (None, 0):
                 raise ValueError(f"bad stake {cfg['stake']!r}")
             _last_cfg, _cfg_warned = cfg, False
+            hook = str(cfg.get("webhook") or "").strip().strip("\"'")
+            if hook.startswith("https://"):
+                WEBHOOK = hook
         except Exception as e:
             if not _cfg_warned:
                 notify(f"⚠️ config.json is invalid ({e}). Keeping the last good settings.")
@@ -395,6 +401,18 @@ def save_stats(st):
             STATS_FILE.write_bytes(blob)
     except Exception as e:
         print("could not save stats:", type(e).__name__, flush=True)
+
+
+def record_game(stats, outcome, profit, unknown):
+    """Hourly UTC buckets (tz-independent) so summary.py can build daily reports in any timezone."""
+    key = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H")
+    b = stats.setdefault("hourly", {}).setdefault(key, {"pnl": 0, "g": 0, "w": 0, "l": 0, "d": 0, "v": 0, "u": 0})
+    b["pnl"] += profit
+    b["g"] += 1
+    b["u" if unknown else {"win": "w", "loss": "l", "draw": "d", "void": "v"}[outcome]] += 1
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=40)).strftime("%Y-%m-%dT%H")
+    for k in [k for k in stats["hourly"] if k < cutoff]:
+        del stats["hourly"][k]
 
 
 def prepare_state():
@@ -1105,7 +1123,7 @@ def main():
             node_v = "?"
         dlog("ENV", python=sys.version.split()[0], node=node_v, cpus=os.cpu_count(), load=os.getloadavg(), actions=int(IN_ACTIONS),
              safe_remaining_s=cfg["safe_remaining_s"], min_delay_ms=cfg["min_delay_ms"], solver_total_ms=7000, tt_bits=24)
-    notify(f"▶️ Connect 4 bot started · {now_str()}\nBooks: {solver.books}\n"
+    notify(f"▶️ {LABEL}Connect 4 bot started · {now_str()}\nBooks: {solver.books}\n"
            f"Stake {fmt(parse_amount(cfg['stake']))} · seat {cfg['seat']} · P/L so far {fmt_signed(stats['pnl'])}")
     games = errors = 0
     blocked_n, blocked_since = 0, None
@@ -1171,6 +1189,7 @@ def main():
                     rec = stats["rec"]
                     rec["u" if unknown else {"win": "w", "loss": "l", "draw": "d", "void": "v"}[outcome]] += 1
                     stats["pnl"] += profit
+                    record_game(stats, outcome, profit, unknown)
                     games += 1
                     errors = 0
 
@@ -1179,6 +1198,8 @@ def main():
                     try:
                         bal = open_lobby(sess)   # fresh load = true balance after payout
                         lobby_ready = True
+                        stats["balance"], stats["balance_at"] = bal, datetime.now(timezone.utc).isoformat(timespec="seconds")
+                        save_stats(stats)
                         save_state(sess.ctx)
                     except BotError as be:
                         if be.fatal or not be.blocked:
@@ -1200,7 +1221,7 @@ def main():
                         wait_min = steps[min(blocked_n - 1, len(steps) - 1)] * random.uniform(0.9, 1.2)
                         blocked_for = (time.monotonic() - blocked_since) / 60
                         if blocked_for + wait_min > float(cfg["cf_give_up_min"]):
-                            notify(f"🛑 Blocked by Cloudflare for {blocked_for:.0f} min. Giving up for this run; "
+                            notify(f"🛑 {LABEL}Blocked by Cloudflare for {blocked_for:.0f} min. Giving up for this run; "
                                    f"the next scheduled run will try again.", e.shot)
                             exit_code, reason = 1, "blocked by Cloudflare"
                             break
@@ -1213,16 +1234,16 @@ def main():
                             reason = "stopped while waiting out a block"
                             break
                         continue
-                    notify(f"❌ **Error** · {now_str()}\n{e}", e.shot)
+                    notify(f"❌ {LABEL}**Error** · {now_str()}\n{e}", e.shot)
                     if e.fatal:
                         stats["dead_hash"] = src_hash
-                        notify("🔑 **Login state is dead. Reload it:** run `python login.py --encrypt` on your PC "
+                        notify(f"🔑 {LABEL}**Login state is dead. Reload it:** run `C4_DATA_PREFIX=accounts/{ACCOUNT or '<name>'} python login.py {ACCOUNT or '<name>'} --encrypt` on your PC "
                                "(Chrome open with --remote-debugging-port=9222 and logged in), then upload the new "
                                "`state.enc` to the private data repo. The bot stays quiet until the state changes.")
                         exit_code, reason = 2, "logged out"; break
                     errors += 1
                 except Exception as e:
-                    notify(f"❌ **Unexpected error** · {now_str()}\n{type(e).__name__}: {e}",
+                    notify(f"❌ {LABEL}**Unexpected error** · {now_str()}\n{type(e).__name__}: {e}",
                            shot(sess.page) if sess else None)
                     errors += 1
 
@@ -1248,7 +1269,7 @@ def main():
         save_stats(stats)
         solver.close()
         dflush("exit")
-        notify(f"⏹️ Connect 4 bot {reason} · games this run: {games} · P/L {fmt_signed(stats['pnl'])}")
+        notify(f"⏹️ {LABEL}Connect 4 bot {reason} · games this run: {games} · P/L {fmt_signed(stats['pnl'])}")
     return exit_code
 
 
