@@ -718,6 +718,25 @@ def best_col(scores):
     return b
 
 
+TURN_TONES = ("creator", "opponent")
+
+
+def dom_view(page):
+    """(status-line tone, any column button enabled) in ONE round trip.
+    tone is the site's own data-tone: 'creator' / 'opponent' (whose turn, whatever the opponent's name is),
+    'wait', or a result tone (win/loss/draw...). Opponent names in the banner text are never used."""
+    try:
+        r = page.evaluate("""() => {
+            const t = document.querySelector('[class*="_turn"][data-tone]');
+            const bs = [...document.querySelectorAll('button[aria-label^="Drop a disc in column"]')];
+            return [t ? t.dataset.tone : null,
+                    bs.some(b => !b.disabled && b.getAttribute('aria-disabled') !== 'true')];
+        }""")
+        return r[0], bool(r[1])
+    except Exception:
+        return None, False
+
+
 def dom_tone(page):
     try:
         return page.evaluate("() => { const e = document.querySelector('[class*=\"_turn\"][data-tone]'); return e ? e.dataset.tone : null; }")
@@ -844,6 +863,7 @@ def play_game(sess, solver, wait_s):
     cfg, cfg_at = get_cfg(), time.monotonic(); set_debug(cfg)
     diag_sent, tries = set(), {}
     last_iter, last_wait, last_click_done, late_key = time.monotonic(), 0.0, 0.0, None
+    last_st = None   # (status, turn): a flip (waiting -> active, intro -> first turn) restarts the "no change" clock
     nobtn, last_nobtn_log = None, 0.0   # (position key, first time the button was missing/disabled)
     dlog("GAMESTART", note="waiting for opponent")
 
@@ -874,6 +894,9 @@ def play_game(sess, solver, wait_s):
             elif rgid != gid:
                 continue
             game, recv_at = g, time.time()
+            st = (g.get("status"), g.get("turn"))
+            if st != last_st:
+                last_st, seen_at = st, time.time()
             seat = my_seat(g, cfg) or seat
             moves = sorted(g["moves"], key=lambda m: m.get("seq", 0))
             cols = [m["column"] for m in moves]
@@ -886,7 +909,7 @@ def play_game(sess, solver, wait_s):
                     skew = float(sn_) - arr * 1000   # server clock minus ours at arrival (ms); big = clock offset
                 except (TypeError, ValueError):
                     span = rem_arr = skew = None
-                dlog("API", n=len(moves), new=int(k != key), turn=g.get("turn"), status=g.get("status"),
+                dlog("API", n=len(moves), new=int(k != key), turn=g.get("turn"), status=g.get("status"), starts_in_s=_f(None if g.get("turnStartsAt") is None or g.get("serverNow") is None else (g["turnStartsAt"] - g["serverNow"]) / 1000),
                      te_type=type(te_).__name__, sn_type=type(sn_).__name__, te_minus_sn_s=_f(span), rem_at_arrival_s=_f(rem_arr),
                      skew_ms=_f(skew, 0), proc_lag_ms=f"{(time.time() - arr) * 1000:.0f}", json_ms=f"{(time.monotonic() - tj) * 1000:.0f}")
             if k != key:
@@ -947,6 +970,19 @@ def play_game(sess, solver, wait_s):
             continue
         if played_key == key and time.time() - played_at < float(cfg.get("retry_ms", 1500)) / 1000:
             page.wait_for_timeout(150)
+            continue
+
+        # The API alone is not trusted (it lags 0.5-7 s on a busy runner and says "your turn" during the
+        # intro countdown). The page must agree: it is our turn AND the board is unlocked.
+        tone, enabled = dom_view(page)
+        if tone not in (None, "wait") and tone not in TURN_TONES:   # win / loss / draw banner: game over
+            page.wait_for_timeout(300)
+            continue
+        if tone in TURN_TONES and tone != seat:                     # page already shows the opponent playing
+            page.wait_for_timeout(100)
+            continue
+        if not enabled:                                             # intro countdown / board locked
+            page.wait_for_timeout(100)
             continue
 
         heights = [0] * W
@@ -1013,7 +1049,10 @@ def play_game(sess, solver, wait_s):
                     diag_sent.add("noeffect")
                     diag(page, game, seat, turn, col, "clicked this column 3 times but the position never changed")
             else:
-                # button missing or disabled (e.g. the start countdown): keep polling and clicking, never block
+                # button missing or disabled: keep polling, never block
+                if played_key == key:      # we already clicked this position; disabled just means it registered
+                    page.wait_for_timeout(150)
+                    continue
                 now_m = time.monotonic()
                 if nobtn is None or nobtn[0] != key:
                     nobtn = (key, now_m)
