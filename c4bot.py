@@ -20,6 +20,7 @@ except Exception:
     pass
 
 HERE = Path(__file__).resolve().parent
+CODE_REV = "2026-10-27-rt-click-v2+cf-create"   # shown in the debug log (ENV line) so you can tell which code ran
 HEADLESS = "--headed" not in sys.argv
 LOBBY_URL = "https://donutflip.net/connect-four"
 HOME_URL = "https://donutflip.net/"
@@ -316,12 +317,13 @@ def attempt_click(page, col, cfg, attempt, seat, tm=None):
     """One click attempt -> 'ok' | 'notmine' | 'over' | 'disabled' | 'missing' | 'slow' | 'err:<Name>'. Never blocks long.
     Attempts alternate: 0 = fast in-page click, 1 = quick human click, 2 = fast, ... (click_mode 'human' = always human)."""
     fast = str(cfg.get("click_mode", "fast")).lower() != "human" and attempt % 2 == 0
+    t_ev = time.monotonic()
     try:
         res = page.evaluate(CLICK_JS, [col, seat, fast])
     except Exception as e:
         res = "slow" if "Timeout" in type(e).__name__ else "err:" + type(e).__name__
     if tm is not None:
-        tm.update(mode="fast" if fast else "human", res=res)
+        tm.update(mode="fast" if fast else "human", res=res, eval_ms=round((time.monotonic() - t_ev) * 1000))
     if res != "ok" or fast:
         return res
     btn = page.locator(f'button[aria-label="Drop a disc in column {col + 1}"]').first
@@ -577,6 +579,7 @@ class Session:
             self.ctx.add_init_script(STEALTH_JS)
             self.page = self.ctx.new_page()
             self.q = deque(maxlen=500)
+            self.api_bad = deque(maxlen=20)   # (http status, method, time) of failed api.donutflip.net responses
             self.listing = None   # game id of our still-unjoined listing ("?" = created, id not seen yet)
             self.page.on("response", self._on_response)
         except Exception:
@@ -585,6 +588,8 @@ class Session:
 
     def _on_response(self, resp):
         try:
+            if "api.donutflip.net" in resp.url and not resp.ok:
+                self.api_bad.append((resp.status, resp.request.method, time.time()))
             if resp.request.method == "GET" and resp.ok and "api.donutflip.net" in resp.url:
                 m = GAME_RE.search(resp.url)
                 if m:
@@ -956,8 +961,14 @@ def play_game(sess, solver, wait_s):
 
         if game is None:
             if time.monotonic() - t_start > 45 and gid is None:
-                raise BotError("Created a game but never saw it in the API. If 'viewer' is missing from the "
-                               "response, set the C4_PLAYER_ID secret.", shot(page))
+                bad = [st for st, _, ts in sess.api_bad if time.time() - ts < 180]
+                cf = is_challenge(page) or any(st in (403, 429, 503) for st in bad)
+                raise BotError("Created a game but never saw it in the API"
+                               + (f" · API errors in the last 3 min: {bad[-6:]}" if bad else " · no API errors seen")
+                               + (f" · page title '{page_title(page)}'" if cf else "")
+                               + (" · treating this as a Cloudflare block (slow backoff retry)." if cf else
+                                  ". If 'viewer' is missing from the API response, set player_id in this account's config.json."),
+                               shot(page), blocked=cf)
             page.wait_for_timeout(200)
             continue
 
@@ -1075,7 +1086,8 @@ def play_game(sess, solver, wait_s):
                     nobtn = (key, now_m)
                 if DEBUG and now_m - last_nobtn_log > 1.0:
                     last_nobtn_log = now_m
-                    dlog("NOBTN", col=col + 1, status=status, waited_ms=round((now_m - nobtn[1]) * 1000), rem_s=_f(rem))
+                    dlog("NOBTN", col=col + 1, status=status, waited_ms=round((now_m - nobtn[1]) * 1000), rem_s=_f(rem),
+                         eval_ms=(tm or {}).get("eval_ms"), rev=CODE_REV)
                 if now_m - nobtn[1] > 8 and "nobtn" not in diag_sent:   # only report it if it persists
                     diag_sent.add("nobtn")
                     diag(page, game, seat, turn, col, "column button missing or disabled on our turn for 8+ s")
@@ -1120,9 +1132,9 @@ def main():
             node_v = subprocess.run(["node", "-v"], capture_output=True, text=True, timeout=10).stdout.strip()
         except Exception:
             node_v = "?"
-        dlog("ENV", python=sys.version.split()[0], node=node_v, cpus=os.cpu_count(), load=os.getloadavg(), actions=int(IN_ACTIONS),
+        dlog("ENV", rev=CODE_REV, python=sys.version.split()[0], node=node_v, cpus=os.cpu_count(), load=os.getloadavg(), actions=int(IN_ACTIONS),
              safe_remaining_s=cfg["safe_remaining_s"], min_delay_ms=cfg["min_delay_ms"], solver_total_ms=7000, tt_bits=24)
-    notify(f"▶️ {LABEL}Connect 4 bot started · {now_str()}\nBooks: {solver.books}\n"
+    notify(f"▶️ {LABEL}Connect 4 bot started · {now_str()} · rev {CODE_REV}\nBooks: {solver.books}\n"
            f"Stake {fmt(parse_amount(cfg['stake']))} · seat {cfg['seat']} · P/L so far {fmt_signed(stats['pnl'])}")
     games = errors = 0
     blocked_n, blocked_since = 0, None
