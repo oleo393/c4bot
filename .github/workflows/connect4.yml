@@ -2,6 +2,12 @@ name: connect4-bot
 
 on:
   workflow_dispatch:        # "Run workflow" button (collaborators only)
+    inputs:
+      account:
+        description: "Which account to start (all = every account)"
+        type: choice
+        default: all
+        options: [all, main, alt, mmain, malt]
   schedule:
     - cron: "7 * * * *"     # hourly; each account exits quietly if enabled=false in its private config
 
@@ -16,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false              # one account failing never stops the others
       matrix:
-        account: [main, alt, mmain, malt]
+        account: ${{ fromJSON(github.event.inputs.account && github.event.inputs.account != 'all' && format('["{0}"]', github.event.inputs.account) || '["main","alt","mmain","malt"]') }}
     concurrency:
       group: connect4-${{ matrix.account }}   # one run per account; a queued run starts when the previous ends
       cancel-in-progress: false
