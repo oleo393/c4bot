@@ -1097,6 +1097,11 @@ class Stop(Exception):
 def main():
     signal.signal(signal.SIGTERM, lambda *a: (_ for _ in ()).throw(KeyboardInterrupt()))
     t_run = time.monotonic()
+    cfg = get_cfg()           # read the config first: a disabled account must exit even without a login state
+    set_debug(cfg)
+    if not cfg["enabled"]:
+        print("Disabled in config.json. Exiting.")
+        return 0
     stats = load_stats()
     stats.setdefault("pnl", 0)
     stats.setdefault("rec", {"w": 0, "l": 0, "d": 0, "v": 0, "u": 0})
@@ -1106,11 +1111,6 @@ def main():
         return 0
     stats.pop("dead_hash", None)
 
-    cfg = get_cfg()
-    set_debug(cfg)
-    if not cfg["enabled"]:
-        print("Disabled in config.json. Exiting.")
-        return 0
     if cfg.get("reset_pnl_token") == stats.get("reset_token") and cfg["max_loss"] \
             and stats["pnl"] <= -parse_amount(cfg["max_loss"]):
         print("Max loss already reached (change reset_pnl_token or max_loss to continue). Exiting.")
