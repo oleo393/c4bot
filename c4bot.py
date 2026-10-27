@@ -267,7 +267,7 @@ def real_click(page, locator, tm=None, quick=False, steps=3):
     t0 = time.monotonic()
     if quick:
         r = locator.evaluate("e => { const b = e.getBoundingClientRect(); return [b.x, b.y, b.width, b.height, innerWidth, innerHeight]; }",
-                             timeout=2000)
+                             timeout=5000)
         box = {"x": r[0], "y": r[1], "width": r[2], "height": r[3]}
         if not (box["width"] > 0 and box["height"] > 0 and box["x"] >= 0 and box["y"] >= 0
                 and box["x"] + box["width"] <= r[4] and box["y"] + box["height"] <= r[5]):
@@ -296,27 +296,35 @@ def real_click(page, locator, tm=None, quick=False, steps=3):
                   move_steps=nsteps, pause_ms=round((t4 - t3) * 1000), click_ms=round((time.monotonic() - t4) * 1000))
 
 
-def attempt_click(page, col, cfg, attempt, tm=None):
-    """One click attempt on a column button -> 'ok' | 'disabled' | 'missing'. Never blocks for long.
+# One browser round-trip does everything: checks that the page agrees it is OUR turn and the board is unlocked, then
+# (fast mode) clicks. Locator-based calls cost several round-trips and a 1 s timeout was routinely exceeded on a busy
+# runner (browser-control latency ~250 ms), which used to be mis-reported as "button missing".
+CLICK_JS = """([col, seat, doClick]) => {
+  const t = document.querySelector('[class*="_turn"][data-tone]');
+  const tone = t ? t.dataset.tone : null;
+  if (tone && tone !== 'creator' && tone !== 'opponent' && tone !== 'wait') return 'over';
+  if (seat && (tone === 'creator' || tone === 'opponent') && tone !== seat) return 'notmine';
+  const b = document.querySelector('button[aria-label="Drop a disc in column ' + (col + 1) + '"]');
+  if (!b) return 'missing';
+  if (b.disabled || b.getAttribute('aria-disabled') === 'true') return 'disabled';
+  if (doClick) b.click();
+  return 'ok';
+}"""
+
+
+def attempt_click(page, col, cfg, attempt, seat, tm=None):
+    """One click attempt -> 'ok' | 'notmine' | 'over' | 'disabled' | 'missing' | 'slow' | 'err:<Name>'. Never blocks long.
     Attempts alternate: 0 = fast in-page click, 1 = quick human click, 2 = fast, ... (click_mode 'human' = always human)."""
-    btn = page.locator(f'button[aria-label="Drop a disc in column {col + 1}"]').first
     fast = str(cfg.get("click_mode", "fast")).lower() != "human" and attempt % 2 == 0
-    if fast:
-        try:   # one browser round-trip, same as the old extension's btn.click()
-            res = btn.evaluate("e => { if (e.disabled) return 'disabled'; e.click(); return 'ok'; }", timeout=1000)
-        except Exception as e:
-            res = "missing" if "Timeout" in type(e).__name__ else "err:" + type(e).__name__
-        if tm is not None:
-            tm.update(mode="fast", res=res)
-        if res in ("ok", "disabled", "missing"):
-            return res
-        # unexpected error: fall through to the human path
-    if not btn.count():
-        return "missing"
-    if not btn.is_enabled():
-        return "disabled"
+    try:
+        res = page.evaluate(CLICK_JS, [col, seat, fast])
+    except Exception as e:
+        res = "slow" if "Timeout" in type(e).__name__ else "err:" + type(e).__name__
     if tm is not None:
-        tm.update(mode="human", res="ok")
+        tm.update(mode="fast" if fast else "human", res=res)
+    if res != "ok" or fast:
+        return res
+    btn = page.locator(f'button[aria-label="Drop a disc in column {col + 1}"]').first
     real_click(page, btn, tm, quick=True, steps=cfg.get("human_steps", 3))
     return "ok"
 
@@ -990,19 +998,6 @@ def play_game(sess, solver, wait_s):
             page.wait_for_timeout(150)
             continue
 
-        # The API alone is not trusted (it lags 0.5-7 s on a busy runner and says "your turn" during the
-        # intro countdown). The page must agree: it is our turn AND the board is unlocked.
-        tone, enabled = dom_view(page)
-        if tone not in (None, "wait") and tone not in TURN_TONES:   # win / loss / draw banner: game over
-            page.wait_for_timeout(300)
-            continue
-        if tone in TURN_TONES and tone != seat:                     # page already shows the opponent playing
-            page.wait_for_timeout(100)
-            continue
-        if not enabled:                                             # intro countdown / board locked
-            page.wait_for_timeout(100)
-            continue
-
         heights = [0] * W
         for m in moves:
             if 0 <= m["column"] < W:
@@ -1054,7 +1049,7 @@ def play_game(sess, solver, wait_s):
                  load=os.getloadavg()[0], sol=sol_sum(sol))
         try:
             tm = {} if DEBUG else None
-            status = attempt_click(page, col, cfg, tries.get(key, 0), tm)
+            status = attempt_click(page, col, cfg, tries.get(key, 0), seat, tm)
             if status == "ok":
                 played_key, played_at = key, time.time()
                 last_click_done = time.monotonic()
@@ -1067,9 +1062,13 @@ def play_game(sess, solver, wait_s):
                     diag_sent.add("noeffect")
                     diag(page, game, seat, turn, col, "clicked this column 3 times but the position never changed")
             else:
-                # button missing or disabled: keep polling, never block
-                if played_key == key:      # we already clicked this position; disabled just means it registered
+                # not clicked: keep polling, never block
+                if status in ("notmine", "over") or played_key == key:   # page shows opponent / game over / our click registered
                     page.wait_for_timeout(150)
+                    continue
+                if status == "slow" or str(status).startswith("err:"):    # browser too slow to answer: just try again
+                    dlog("SLOWCLICK", status=status, col=col + 1, rem_s=_f(rem))
+                    page.wait_for_timeout(50)
                     continue
                 now_m = time.monotonic()
                 if nobtn is None or nobtn[0] != key:
