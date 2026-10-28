@@ -20,19 +20,23 @@ except Exception:
     pass
 
 HERE = Path(__file__).resolve().parent
-CODE_REV = "2026-10-27-rt-click-v2+cf-create"   # shown in the debug log (ENV line) so you can tell which code ran
+CODE_REV = "2026-10-28-slots+claims+nowindow"   # shown in the debug log (ENV line) so you can tell which code ran
 HEADLESS = "--headed" not in sys.argv
 LOBBY_URL = "https://donutflip.net/connect-four"
 HOME_URL = "https://donutflip.net/"
 
 STORE = Store()   # reads C4_DATA_REPO / C4_DATA_TOKEN / C4_DATA_PREFIX (e.g. accounts/alt)
 ACCOUNT = os.environ.get("C4_ACCOUNT", "").strip()
-LABEL = f"[{ACCOUNT}] " if ACCOUNT else ""
+SLOT = os.environ.get("C4_SLOT", "").strip().lstrip("-")   # "" = the account's main session; "1", "2" = extra sessions
+SFX = f"-{SLOT}" if SLOT else ""
+STATE_NAME, STATS_NAME = f"state{SFX}.enc", f"stats{SFX}.enc"   # per-session files inside accounts/<account>/
+LABEL = f"[{ACCOUNT}{SFX}] " if ACCOUNT else (f"[{SLOT}] " if SLOT else "")
+ME = (ACCOUNT or "account") + SFX        # this session's name in claims.json
 IN_ACTIONS = bool(os.environ.get("GITHUB_ACTIONS"))
 CONFIG_FILE = HERE / "config.json"         # local-dev fallback (gitignored)
-STATE_ENC = HERE / "state.enc"             # local-dev fallback (gitignored)
+STATE_ENC = HERE / STATE_NAME             # local-dev fallback (gitignored)
 STATE_FILE = HERE / "storage_state.json"   # decrypted copy, never committed
-STATS_FILE = HERE / "stats.enc"            # local-dev fallback (gitignored)
+STATS_FILE = HERE / STATS_NAME            # local-dev fallback (gitignored)
 SECRET_FILE = HERE / ".secret"
 BOOKS_DIR = os.environ.get("C4_BOOKS_DIR", str(HERE / "books"))
 RUN_START = time.monotonic()
@@ -78,10 +82,21 @@ SEATS = ("creator", "opponent")
 other = lambda s: "opponent" if s == "creator" else "creator"
 
 
+class Yielded(Exception):
+    """This session was following a game that another session of the same account already follows: it gave up its window."""
+    def __init__(self, gid):
+        super().__init__(f"yielded game {gid}")
+        self.gid = gid
+
+
+class NoWindow(Exception):
+    """We clicked Create but no game window / unique game API showed up in this browser."""
+
+
 class BotError(Exception):
-    def __init__(self, msg, shot=None, fatal=False, blocked=False):
+    def __init__(self, msg, shot=None, fatal=False, blocked=False, limit=False):
         super().__init__(msg)
-        self.shot, self.fatal, self.blocked = shot, fatal, blocked
+        self.shot, self.fatal, self.blocked, self.limit = shot, fatal, blocked, limit
 
 
 # ---------------------------------------------------------------- helpers
@@ -354,8 +369,16 @@ def get_cfg():
         raw = CONFIG_FILE.read_text(encoding="utf-8-sig")
     if raw is not None:
         try:
+            data = json.loads(raw)
+            if SLOT:   # extra session: base settings + the overrides in "slots": {"1": {...}}; not listed = off
+                ov = (data.get("slots") or {}).get(SLOT)
+                if isinstance(ov, dict):
+                    data.update({k: v for k, v in ov.items() if not k.startswith("_")})
+                else:
+                    data["enabled"] = False
+            data.pop("slots", None)
             cfg = dict(DEFAULT_CFG)
-            cfg.update({k: v for k, v in json.loads(raw).items() if not k.startswith("_")})
+            cfg.update({k: v for k, v in data.items() if not k.startswith("_")})
             if parse_amount(cfg["stake"]) in (None, 0):
                 raise ValueError(f"bad stake {cfg['stake']!r}")
             _last_cfg, _cfg_warned = cfg, False
@@ -395,7 +418,7 @@ def _unseal(blob):
 
 def load_stats():
     try:
-        blob = STORE.get("stats.enc") if STORE.enabled else (STATS_FILE.read_bytes() if STATS_FILE.exists() else None)
+        blob = STORE.get(STATS_NAME) if STORE.enabled else (STATS_FILE.read_bytes() if STATS_FILE.exists() else None)
         return json.loads(_unseal(blob)) if blob else {}
     except Exception as e:
         print("could not load stats:", type(e).__name__, flush=True)
@@ -406,7 +429,7 @@ def save_stats(st):
     blob = _seal(json.dumps(st).encode())
     try:
         if STORE.enabled:
-            STORE.put("stats.enc", blob, "stats")
+            STORE.put(STATS_NAME, blob, "stats")
         else:
             STATS_FILE.write_bytes(blob)
     except Exception as e:
@@ -431,7 +454,7 @@ def prepare_state():
     f = _fernet()
     blob = None
     if STORE.enabled:
-        blob = STORE.get("state.enc")
+        blob = STORE.get(STATE_NAME)
     elif STATE_ENC.exists():
         blob = STATE_ENC.read_bytes()
     if blob:
@@ -458,7 +481,7 @@ def save_state(ctx):
     try:
         blob = f.encrypt(json.dumps(ctx.storage_state()).encode())
         if STORE.enabled:
-            STORE.put("state.enc", blob, "session")
+            STORE.put(STATE_NAME, blob, "session")
         else:
             STATE_ENC.write_bytes(blob)
     except Exception as e:
@@ -580,6 +603,8 @@ class Session:
             self.page = self.ctx.new_page()
             self.q = deque(maxlen=500)
             self.api_bad = deque(maxlen=20)   # (http status, method, time) of failed api.donutflip.net responses
+            self.created = False   # we clicked "Create game" and have not yet adopted our own game
+            self.dup = None        # set (by the claims thread) to the name of an earlier session following the same game
             self.listing = None   # game id of our still-unjoined listing ("?" = created, id not seen yet)
             self.page.on("response", self._on_response)
         except Exception:
@@ -629,6 +654,8 @@ def open_lobby(sess):
 
 def create_game(sess, stake):
     page = sess.page
+    sess.created, sess.dup = False, None
+    close_game_window(page)   # a game of another session may have popped up over the lobby
     inp = page.locator(STAKE_INPUT)
     try:
         inp.wait_for(state="visible", timeout=8000)
@@ -650,6 +677,7 @@ def create_game(sess, stake):
             break
     else:
         raise BotError(f"Could not set stake to {want} (field shows '{inp.input_value()}')", shot(page))
+    close_game_window(page)   # it may also pop up while the stake is typed
     sess.q.clear()
     btn = page.locator(CREATE_BTN).first
     btn.wait_for(state="visible", timeout=8000)
@@ -657,6 +685,27 @@ def create_game(sess, stake):
         raise BotError("'Create game' button is disabled (balance too low or an open game exists?)", shot(page))
     real_click(page, btn)
     sess.listing = "?"
+    sess.created = True
+    # At the open-game limit the site creates nothing and shows: "You can have up to 3 open games"
+    end = time.monotonic() + 3.5
+    while time.monotonic() < end:
+        try:
+            err = page.locator("div.pxHubq_error[role=alert]")
+            if err.count() and err.first.is_visible():
+                txt = err.first.inner_text(timeout=1500).strip()
+                if re.search(r"(?i)open games|up to \d+", txt):
+                    try:
+                        page.locator("div.pxHubq_error button[aria-label='Dismiss error']").first.click(timeout=2000)
+                    except Exception:
+                        pass
+                    sess.listing = None
+                    raise BotError("open-game limit reached: " + txt[:80], limit=True)
+                break   # some other error text: the 45 s "never saw it in the API" check reports it
+        except BotError:
+            raise
+        except Exception:
+            pass
+        page.wait_for_timeout(300)
 
 
 # ---------------------------------------------------------------- game logic
@@ -789,7 +838,8 @@ def _card_cancel(page, gid):
     if gid and re.fullmatch(r"[0-9A-Fa-f-]{8,64}", gid):   # our card = the one whose avatar URL has our game id
         return page.locator("xpath=//div[contains(@class,'cardActions')]/button[normalize-space()='Cancel']"
                             f"[../..//img[contains(@src,'/game/{gid}/')]]")
-    return page.locator("xpath=//div[contains(@class,'cardActions')]/button[normalize-space()='Cancel']")
+    # game id unknown: cancel NOTHING from the lobby (other sessions of this account have Cancel buttons too)
+    return page.locator("xpath=//div[@id='__no_such_card__']")
 
 
 def _press(page, loc):
@@ -879,6 +929,190 @@ def diag(page, game, seat, turn, col, why):
            f"api_keys={sorted(g.keys())}\nmove_keys={sorted(mv[0].keys())}\npage={info}", shot(page))
 
 
+# ---------------------------------------------------------------- one browser per game (sessions of one account)
+# Every session of an account is a separate browser. A game window that pops up in a browser sitting in the lobby can
+# show a game another session already plays (both then receive the same API). The sessions share claims.json in the
+# private data repo ({session: {gid, seen, ts}}); the session that saw a game LATER closes its window (Esc) and goes on to create its own game. Without STORE (local use) none of this is active.
+CSTORE = Store(prefix=f"accounts/{ACCOUNT}") if (ACCOUNT and STORE.enabled) else None
+CLAIMS_FILE = "claims.json"
+_claims_lock = threading.Lock()
+_claim_state = {"on": False}
+WINDOW = "section.pxHubq_modal[aria-label='Connect Four game']"
+CARD_GID_RE = re.compile(r"/connect-four/game/([0-9A-Fa-f-]{8,64})/")
+
+
+def claims_read():
+    if CSTORE is None:
+        return {}
+    blob = CSTORE.get(CLAIMS_FILE)
+    data = json.loads(blob.decode("utf-8-sig")) if blob else {}
+    cutoff = time.time() - 3 * 3600
+    return {k: v for k, v in data.items() if isinstance(v, dict) and (v.get("ts") or 0) > cutoff}
+
+
+def claims_set(entry):
+    """entry = dict (follow this game) or None (release). Read-merge-write with retries: sessions never overwrite each other."""
+    if CSTORE is None:
+        return False
+    for attempt in range(8):
+        try:
+            with _claims_lock:
+                data = claims_read()          # also refreshes the file's sha
+                if entry is None:
+                    data.pop(ME, None)
+                else:
+                    data[ME] = entry
+                CSTORE.put_once(CLAIMS_FILE, (json.dumps(data) + "\n").encode(), "claims")
+            return True
+        except requests.HTTPError as e:
+            if getattr(e.response, "status_code", 0) not in (409, 422, 500, 502, 503):
+                break
+        except Exception:
+            break
+        time.sleep(random.uniform(0.15, 0.6) * (attempt + 1))
+    dlog("CLAIMFAIL", entry=int(entry is not None))
+    return False
+
+
+def duplicate_of(gid, my_seen):
+    """Name of another session that follows `gid` and saw it earlier than we did (we must then give up), else None."""
+    try:
+        data = claims_read()
+    except Exception as e:
+        dlog("CLAIMERR", err=type(e).__name__)
+        return None
+    for k, v in data.items():
+        if k != ME and v.get("gid") == gid:
+            try:
+                if (float(v.get("seen") or 0), k) < (float(my_seen), ME):
+                    return k
+            except (TypeError, ValueError):
+                return k
+    return None
+
+
+def claim_async(sess, gid, seen):
+    """Publish 'I follow gid', then re-check a few seconds later (covers two sessions adopting at the very same moment)."""
+    _claim_state["on"] = True
+
+    def work():
+        claims_set({"gid": gid, "seen": seen, "ts": time.time()})
+        time.sleep(2.5)
+        k = duplicate_of(gid, seen)
+        if k:
+            sess.dup = k
+    threading.Thread(target=work, daemon=True).start()
+
+
+def claim_release_async():
+    if _claim_state["on"]:
+        _claim_state["on"] = False
+        threading.Thread(target=claims_set, args=(None,), daemon=True).start()
+
+
+def close_game_window(page):
+    """Close an open game window with Esc (fast and reliable); background click and the X button are fallbacks.
+    True = no window left."""
+    for attempt in range(4):
+        try:
+            if page.locator(WINDOW).count() == 0:
+                return True
+            if attempt < 2:
+                page.keyboard.press("Escape")
+            elif attempt == 2:
+                page.mouse.click(6, 6)                    # overlay corner, far from the centred window
+            else:
+                page.locator("button[aria-label='Close game']").first.click(timeout=3000)   # last resort
+            page.wait_for_timeout(400)
+        except Exception:
+            pass
+    try:
+        return page.locator(WINDOW).count() == 0
+    except Exception:
+        return False
+
+
+def own_waiting_gids(page):
+    """Game ids of the lobby cards that have a Cancel button (= the waiting listings of this account)."""
+    try:
+        srcs = page.evaluate("""() => [...document.querySelectorAll('div[class*=cardActions] > button')]
+            .filter(b => b.textContent.trim() === 'Cancel')
+            .map(b => { const a = b.closest('article'); const i = a ? a.querySelector('img[src*="/game/"]') : null; return i ? i.src : null; })""")
+    except Exception:
+        return set()
+    return {m.group(1) for m in (CARD_GID_RE.search(x or "") for x in srcs) if m}
+
+
+NO_WINDOW_S = 8   # seconds after Create without a game window / unique API before we look at the listings
+
+
+def window_open(page):
+    try:
+        return page.locator(WINDOW).count() > 0
+    except Exception:
+        return False
+
+
+def reconcile_extras(sess, exclude=(), reload_first=True):
+    """Cancel the waiting listings of this account that no session follows (a listing without an open window cannot be
+    played, it would be lost to inactivity). A card counts as 'extra' only if it is unclaimed in TWO reads 3 s apart,
+    because another session's claim can still be on its way. Returns the number of listings cancelled."""
+    page = sess.page
+    sess.listing = None
+
+    def extras():
+        gids = own_waiting_gids(page) - set(exclude)
+        claimed = {v.get("gid") for k, v in claims_read().items() if k != ME}
+        return gids - claimed, len(gids)
+
+    try:
+        if reload_first:
+            open_lobby(sess)
+        e1, n1 = extras()
+        dlog("EXTRAS", read=1, waiting=n1, unclaimed=len(e1))
+        if not e1:
+            return 0                     # nothing was created: the caller simply creates again
+        page.wait_for_timeout(3000)
+        open_lobby(sess)
+        e2, n2 = extras()
+        dlog("EXTRAS", read=2, waiting=n2, unclaimed=len(e2))
+        done = 0
+        for gid in sorted(e1 & e2):
+            sess.listing = gid
+            if cancel_listing(sess):
+                done += 1
+            sess.listing = None
+        print(f"[game] cancelled {done} unclaimed listing(s) that had no window", flush=True)
+        return done
+    except BotError:
+        raise
+    except Exception as e:
+        print("reconcile failed:", type(e).__name__, flush=True)
+        return 0
+    finally:
+        sess.listing = None
+
+
+def never_saw_error(sess):
+    page = sess.page
+    bad = [st for st, _, ts in sess.api_bad if time.time() - ts < 180]
+    cf = is_challenge(page) or any(st in (403, 429, 503) for st in bad)
+    return BotError("Created a game but never saw it in the API"
+                    + (f" · API errors in the last 3 min: {bad[-6:]}" if bad else " · no API errors seen")
+                    + (f" · page title '{page_title(page)}'" if cf else "")
+                    + (" · treating this as a Cloudflare block (slow backoff retry)." if cf else
+                       ". If 'viewer' is missing from the API response, set player_id in this account's config.json."),
+                    shot(page), blocked=cf)
+
+
+def give_up_window(sess, gid, why):
+    dlog("YIELD", why=why)
+    print("[game] another session already follows this game: closing the window", flush=True)
+    close_game_window(sess.page)
+    sess.listing = None
+    raise Yielded(gid)
+
+
 def play_game(sess, solver, wait_s):
     """Wait for the listing to be joined, play it to the end. Returns (game, role, sol) or None if nobody joined."""
     page, q = sess.page, sess.q
@@ -894,6 +1128,7 @@ def play_game(sess, solver, wait_s):
     cfg, cfg_at = get_cfg(), time.monotonic(); set_debug(cfg)
     diag_sent, tries = set(), {}
     last_iter, last_wait, last_click_done, late_key = time.monotonic(), 0.0, 0.0, None
+    last_win_chk = 0.0
     last_st = None   # (status, turn): a flip (waiting -> active, intro -> first turn) restarts the "no change" clock
     nobtn, last_nobtn_log = None, 0.0   # (position key, first time the button was missing/disabled)
     dlog("GAMESTART", note="waiting for opponent")
@@ -906,6 +1141,8 @@ def play_game(sess, solver, wait_s):
             last_iter = _now
         if time.monotonic() - cfg_at > 20:
             cfg, cfg_at = get_cfg(), time.monotonic(); set_debug(cfg)
+        if sess.dup and gid:
+            give_up_window(sess, gid, f"{sess.dup} saw it first")
         while q:
             rgid, resp, arr = q.popleft()
             tj = time.monotonic()
@@ -920,7 +1157,12 @@ def play_game(sess, solver, wait_s):
                 if is_done(g) or my_seat(g, cfg) is None:
                     continue
                 gid = rgid
-                sess.listing = gid
+                seen_ms = g.get("serverNow") or int(time.time() * 1000)
+                if CSTORE is not None and duplicate_of(gid, seen_ms):   # same game as another session: later one yields
+                    give_up_window(sess, gid, "claimed by another session")
+                sess.listing, sess.created = gid, False
+                if CSTORE is not None:
+                    claim_async(sess, gid, seen_ms)
                 print("[game] tracking" if IN_ACTIONS else f"[game] tracking {gid}", flush=True)
             elif rgid != gid:
                 continue
@@ -960,15 +1202,14 @@ def play_game(sess, solver, wait_s):
                 sess.listing = None          # someone joined: nothing to cancel any more
 
         if game is None:
-            if time.monotonic() - t_start > 45 and gid is None:
-                bad = [st for st, _, ts in sess.api_bad if time.time() - ts < 180]
-                cf = is_challenge(page) or any(st in (403, 429, 503) for st in bad)
-                raise BotError("Created a game but never saw it in the API"
-                               + (f" · API errors in the last 3 min: {bad[-6:]}" if bad else " · no API errors seen")
-                               + (f" · page title '{page_title(page)}'" if cf else "")
-                               + (" · treating this as a Cloudflare block (slow backoff retry)." if cf else
-                                  ". If 'viewer' is missing from the API response, set player_id in this account's config.json."),
-                               shot(page), blocked=cf)
+            waited = time.monotonic() - t_start
+            if gid is None and waited > NO_WINDOW_S and time.monotonic() - last_win_chk > 1.0:
+                last_win_chk = time.monotonic()
+                if not window_open(page):
+                    dlog("NOWINDOW", waited_s=_f(waited))
+                    raise NoWindow()
+            if gid is None and waited > 45:
+                raise never_saw_error(sess)
             page.wait_for_timeout(200)
             continue
 
@@ -1138,6 +1379,9 @@ def main():
            f"Stake {fmt(parse_amount(cfg['stake']))} · seat {cfg['seat']} · P/L so far {fmt_signed(stats['pnl'])}")
     games = errors = 0
     blocked_n, blocked_since = 0, None
+    limit_n = 0
+    skip_reload = False
+    no_win_n = 0
 
     def nap(seconds):
         """Sleep, but wake up to honour 'enabled: false' and the runtime limit. False = stop now."""
@@ -1176,18 +1420,41 @@ def main():
                     if sess is None:
                         sess = Session(p)
                         lobby_ready = False
-                    if not lobby_ready:
+                    if not lobby_ready and not skip_reload:
                         bal = open_lobby(sess)
                         if blocked_n:
                             notify(f"✅ Cloudflare cleared after {blocked_n} retries "
                                    f"({(time.monotonic() - blocked_since) / 60:.0f} min). Resuming.")
                             blocked_n, blocked_since = 0, None
                     lobby_ready = False
+                    skip_reload = False
                     if bal < stake or (cfg["min_balance"] and bal < parse_amount(cfg["min_balance"])):
                         reason = f"balance {fmt(bal)} is below the stake/min_balance"; break
 
                     create_game(sess, stake)
-                    result = play_game(sess, solver, float(cfg["opponent_wait_s"]))
+                    try:
+                        result = play_game(sess, solver, float(cfg["opponent_wait_s"]))
+                    except Yielded as y:
+                        # a window of a game another session plays was in our way: it is closed now, make our own game
+                        if sess.created:   # our own listing is now waiting without a window: cancel unclaimed extras
+                            reconcile_extras(sess, exclude={y.gid}, reload_first=False)
+                        sess.created = False
+                        dflush(f"yield {games + 1}")
+                        skip_reload = True
+                        continue
+                    except NoWindow:
+                        # no window / unique API after Create: count the lobby listings, cancel extras, then create again
+                        sess.created = False
+                        no_win_n += 1
+                        if no_win_n >= 4:
+                            no_win_n = 0
+                            raise never_saw_error(sess)
+                        reconcile_extras(sess, reload_first=True)
+                        dflush(f"nowindow {games + 1}")
+                        skip_reload = True
+                        continue
+                    finally:
+                        claim_release_async()
                     dflush(f"after game {games + 1}")
                     if result is None:
                         ok = cancel_listing(sess)      # never leave an unjoined listing behind
@@ -1203,6 +1470,8 @@ def main():
                     record_game(stats, outcome, profit, unknown)
                     games += 1
                     errors = 0
+                    limit_n = 0
+                    no_win_n = 0
 
                     save_stats(stats)
                     sess.page.wait_for_timeout(int(PAYOUT_SETTLE_S * 1000))
@@ -1225,6 +1494,14 @@ def main():
                     time.sleep(END_BUFFER_S)
 
                 except BotError as e:
+                    if e.limit:
+                        limit_n += 1
+                        if limit_n == 1 or limit_n % 10 == 0:
+                            notify(f"⏳ {LABEL}{e}. Waiting for a slot to free up; retrying about every minute.")
+                        if not nap(random.uniform(45, 75)):
+                            reason = "stopped while waiting for a free listing slot"
+                            break
+                        continue
                     if e.blocked:
                         blocked_n += 1
                         blocked_since = blocked_since or time.monotonic()
@@ -1248,7 +1525,7 @@ def main():
                     notify(f"❌ {LABEL}**Error** · {now_str()}\n{e}", e.shot)
                     if e.fatal:
                         stats["dead_hash"] = src_hash
-                        notify(f"🔑 {LABEL}**Login state is dead. Reload it:** run `C4_DATA_PREFIX=accounts/{ACCOUNT or '<name>'} python login.py {ACCOUNT or '<name>'} --encrypt` on your PC "
+                        notify(f"🔑 {LABEL}**Login state is dead. Reload it:** run `python login.py {(ACCOUNT + SFX) or '<name>'} --encrypt` on your PC "
                                "(Chrome open with --remote-debugging-port=9222 and logged in), then upload the new "
                                "`state.enc` to the private data repo. The bot stays quiet until the state changes.")
                         exit_code, reason = 2, "logged out"; break
