@@ -20,7 +20,7 @@ except Exception:
     pass
 
 HERE = Path(__file__).resolve().parent
-CODE_REV = "2026-10-28-slots+claims+nowindow"   # shown in the debug log (ENV line) so you can tell which code ran
+CODE_REV = "2026-10-28-slots+claims+nowindow+cfcycle+headed"   # shown in the debug log (ENV line) so you can tell which code ran
 HEADLESS = "--headed" not in sys.argv
 LOBBY_URL = "https://donutflip.net/connect-four"
 HOME_URL = "https://donutflip.net/"
@@ -55,7 +55,9 @@ DEFAULT_CFG = {
     "opponent_wait_s": 1800,    # give up on an unjoined listing after this many seconds (0 = never)
     "safe_remaining_s": 2,      # play best-so-far when the turn timer is this low
     "min_delay_ms": 400,        # wait this long after a new position before clicking
-    "cf_retry_minutes": [3, 5, 10, 20, 30, 60],  # waits between retries when Cloudflare blocks (last value repeats)
+    "cf_retry_minutes": [1, 3, 5, 10, 20],  # waits between retries when Cloudflare blocks
+    "cf_cycle": True,           # true = after the last wait start again from the first (1, 3, 5, 10, 20, 1, 3, ...); false = last value repeats
+    "headed": False,            # true = real (non-headless) Chrome; the workflow runs the bot under xvfb so this works on GitHub Actions
     "cf_give_up_min": 300,      # stop after being blocked this long in a row (the next hourly run tries again)
     "retry_ms": 1500,           # re-click if the position has not changed this long after a click (fast and human attempts alternate)
     "human_steps": 3,           # mouse-move steps of the human click (each step costs ~0.25 s on a busy runner)
@@ -591,11 +593,12 @@ try {
 
 
 class Session:
-    def __init__(self, p):
-        self.browser = p.chromium.launch(channel="chrome", headless=HEADLESS,
+    def __init__(self, p, headed=False):
+        headless = HEADLESS and not headed       # --headed on the command line or "headed": true in the config
+        self.browser = p.chromium.launch(channel="chrome", headless=headless,
                                          ignore_default_args=["--enable-automation"],
                                          args=["--disable-blink-features=AutomationControlled"])
-        dlog("BROWSER", version=self.browser.version, headless=HEADLESS)
+        dlog("BROWSER", version=self.browser.version, headless=headless)
         try:
             self.ctx = self.browser.new_context(storage_state=str(STATE_FILE),
                                                 viewport={"width": 1366, "height": 800})
@@ -1418,7 +1421,7 @@ def main():
 
                 try:
                     if sess is None:
-                        sess = Session(p)
+                        sess = Session(p, bool(cfg.get("headed")))
                         lobby_ready = False
                     if not lobby_ready and not skip_reload:
                         bal = open_lobby(sess)
@@ -1506,7 +1509,8 @@ def main():
                         blocked_n += 1
                         blocked_since = blocked_since or time.monotonic()
                         steps = cfg["cf_retry_minutes"] or [5]
-                        wait_min = steps[min(blocked_n - 1, len(steps) - 1)] * random.uniform(0.9, 1.2)
+                        idx = (blocked_n - 1) % len(steps) if cfg.get("cf_cycle", True) else min(blocked_n - 1, len(steps) - 1)
+                        wait_min = steps[idx] * random.uniform(0.9, 1.2)
                         blocked_for = (time.monotonic() - blocked_since) / 60
                         if blocked_for + wait_min > float(cfg["cf_give_up_min"]):
                             notify(f"🛑 {LABEL}Blocked by Cloudflare for {blocked_for:.0f} min. Giving up for this run; "
