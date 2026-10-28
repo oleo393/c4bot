@@ -1,12 +1,12 @@
 """Daily report for all accounts -> the summary webhook. Runs hourly from daily-summary.yml, but sends only
 once per day: at/after `summary_hour` (local time of `timezone`) and only if that day was not reported yet.
 
-Reads from the PRIVATE data repo:  summary.json, accounts/<name>/stats.enc (every folder under accounts/), summary_state.json (written here).
+Reads from the PRIVATE data repo:  summary.json, accounts/<name>/stats.enc (every folder under accounts/, every stats*.enc inside it = one session), summary_state.json (written here).
 Usage:  python summary.py            normal (scheduled) run
         python summary.py --force    send now for yesterday, ignore the once-a-day guard (does not mark it as sent)
         python summary.py --date 2026-10-26   report that day (implies --force)
 """
-import json, os, sys, time
+import json, os, re, sys, time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -48,9 +48,18 @@ def load_json(store, path, default):
     return json.loads(blob.decode("utf-8-sig"))
 
 
-def load_stats(name):
-    st = Store(prefix=f"accounts/{name}")
-    blob = st.get("stats.enc")
+def sessions_of(account):
+    """[(session name, stats file)] for accounts/<account>/: stats.enc -> 'main', stats-1.enc -> 'main-1' ..."""
+    out = []
+    for fn in Store(prefix=f"accounts/{account}").list_files():
+        m = re.fullmatch(r"stats(?:-(\d+))?\.enc", fn)
+        if m:
+            out.append((account + (f"-{m.group(1)}" if m.group(1) else ""), fn))
+    return out
+
+
+def load_stats(account, fname):
+    blob = Store(prefix=f"accounts/{account}").get(fname)
     return json.loads(unseal(blob)) if blob else {}
 
 
@@ -109,10 +118,11 @@ def main():
 
     rows_day, rows_all, tot_d = [], [], {"pnl": 0, "g": 0, "w": 0, "l": 0, "d": 0}
     tot_all = {"pnl": 0, "w": 0, "l": 0, "d": 0}
-    tot_bal, any_bal = 0, False
-    for name in accounts:
+    acct_bal, any_bal = {}, False
+    sessions = [x for acc in accounts for x in sessions_of(acc)]
+    for name, (acc, fname) in [(n, (n.split("-")[0], f)) for n, f in sessions]:
         try:
-            st = load_stats(name)
+            st = load_stats(acc, fname)
         except Exception as e:
             print("stats load failed for", name, type(e).__name__)
             st = {}
@@ -126,17 +136,19 @@ def main():
         tot_all["pnl"] += st.get("pnl", 0)
         for f in ("w", "l", "d"):
             tot_all[f] += rec.get(f, 0)
-        if bal is not None:
-            tot_bal += bal
+        if bal is not None:   # sessions of one account share ONE balance: keep the most recent reading per account
             any_bal = True
+            at = st.get("balance_at") or ""
+            if acc not in acct_bal or at >= acct_bal[acc][0]:
+                acct_bal[acc] = (at, bal)
+    tot_bal = sum(v for _, v in acct_bal.values())
     rows_day.append(["TOTAL", fmt_signed(tot_d["pnl"]), tot_d["w"], tot_d["l"], tot_d["d"], tot_d["g"], fmt(tot_bal) if any_bal else "n/a"])
     rows_all.append(["TOTAL", fmt_signed(tot_all["pnl"]), tot_all["w"], tot_all["l"], tot_all["d"]])
 
-    msg = (f"\U0001F4CA **Daily report** · {day} ({g.get('timezone') or 'UTC'})\n"
-           "```\n" + table(rows_day, ["", "P/L", "W", "L", "D", "games", "balance"]) + "\n```\n"
-           "**All-time** (since last P/L reset)\n"
-           "```\n" + table(rows_all, ["", "P/L", "W", "L", "D"]) + "\n```")
-    send(webhook, msg)
+    send(webhook, f"\U0001F4CA **Daily report** · {day} ({g.get('timezone') or 'UTC'})\n"
+                  "```\n" + table(rows_day, ["", "P/L", "W", "L", "D", "games", "balance"]) + "\n```")
+    send(webhook, "**All-time** (since last P/L reset)\n"
+                  "```\n" + table(rows_all, ["", "P/L", "W", "L", "D"]) + "\n```")
     print("Report sent for", day)
     if not FORCE:
         state["last_sent"] = day
