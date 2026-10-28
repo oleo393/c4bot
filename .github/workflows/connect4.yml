@@ -4,7 +4,7 @@ on:
   workflow_dispatch:        # "Run workflow" button (collaborators only)
     inputs:
       runner:
-        description: "all | main (that session only) | main-1 (one extra session) | main* (every session of main)"
+        description: "One or more, separated by commas: all, main, main-1, alt* (alt* = every session of alt)"
         type: string
         default: all
   schedule:
@@ -29,15 +29,16 @@ jobs:
           # A session without a login state or without an entry under "slots" in its config simply exits.
           ACCOUNTS = ["main", "alt", "mmain", "malt"]
           SLOTS = ["", "1", "2"]
-          pick = os.environ.get("PICK", "").strip()
+          import re
+          picks = [x for x in re.split(r"[,\s|]+", os.environ.get("PICK", "").strip()) if x] or ["all"]
           items = []
           for a in ACCOUNTS:
               for s in SLOTS:
                   name = a + (f"-{s}" if s else "")
-                  if pick in ("", "all") or pick == name or (pick.endswith("*") and pick[:-1] == a):
+                  if any(k == "all" or k == name or (k.endswith("*") and k[:-1] == a) for k in picks):
                       items.append({"account": a, "slot": s, "name": name})
           if not items:
-              raise SystemExit(f"Nothing matches '{pick}'")
+              raise SystemExit(f"Nothing matches {picks}. Use: all, main, main-1, alt* (comma separated)")
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write("matrix=" + json.dumps({"include": items}) + "\n")
           PY
@@ -70,5 +71,7 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12", cache: pip }
       - run: pip install -r requirements.txt
+      - name: Virtual display for headed Chrome
+        run: which xvfb-run >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq xvfb)
       - name: Run bot
-        run: python c4bot.py
+        run: xvfb-run -a -s "-screen 0 1600x1000x24" python c4bot.py
