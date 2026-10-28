@@ -3,38 +3,66 @@ name: connect4-bot
 on:
   workflow_dispatch:        # "Run workflow" button (collaborators only)
     inputs:
-      account:
-        description: "Which account to start (all = every account)"
-        type: choice
+      runner:
+        description: "all | main (that session only) | main-1 (one extra session) | main* (every session of main)"
+        type: string
         default: all
-        options: [all, main, alt, mmain, malt]
   schedule:
-    - cron: "7 * * * *"     # hourly; each account exits quietly if enabled=false in its private config
+    - cron: "7 * * * *"     # hourly; a session exits quietly if it is disabled / not configured in its private config
 
 permissions:
   contents: read
 
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        env:
+          PICK: ${{ github.event.inputs.runner }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          # EDIT HERE: your accounts and how many sessions each can run ("" = main session, "1", "2" = extra ones).
+          # A session without a login state or without an entry under "slots" in its config simply exits.
+          ACCOUNTS = ["main", "alt", "mmain", "malt"]
+          SLOTS = ["", "1", "2"]
+          pick = os.environ.get("PICK", "").strip()
+          items = []
+          for a in ACCOUNTS:
+              for s in SLOTS:
+                  name = a + (f"-{s}" if s else "")
+                  if pick in ("", "all") or pick == name or (pick.endswith("*") and pick[:-1] == a):
+                      items.append({"account": a, "slot": s, "name": name})
+          if not items:
+              raise SystemExit(f"Nothing matches '{pick}'")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("matrix=" + json.dumps({"include": items}) + "\n")
+          PY
+
   play:
+    needs: plan
+    name: ${{ matrix.name }}
     if: github.repository_owner == github.actor || github.event_name == 'schedule'
-    runs-on: ubuntu-latest          # one fresh 4 vCPU / 16 GB VM per account
+    runs-on: ubuntu-latest          # one fresh 4 vCPU / 16 GB VM per session
     timeout-minutes: 355
     strategy:
-      fail-fast: false              # one account failing never stops the others
-      matrix:
-        account: ${{ fromJSON(github.event.inputs.account && github.event.inputs.account != 'all' && format('["{0}"]', github.event.inputs.account) || '["main","alt","mmain","malt"]') }}
+      fail-fast: false              # one session failing never stops the others
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     concurrency:
-      group: connect4-${{ matrix.account }}   # one run per account; a queued run starts when the previous ends
+      group: connect4-${{ matrix.name }}      # one run per session; a queued run starts when the previous ends
       cancel-in-progress: false
     env:
       STATE_KEY: ${{ secrets.STATE_KEY }}
       C4_DATA_REPO: ${{ secrets.C4_DATA_REPO }}
       C4_DATA_TOKEN: ${{ secrets.C4_DATA_TOKEN }}
       C4_ACCOUNT: ${{ matrix.account }}
+      C4_SLOT: ${{ matrix.slot }}
       C4_DATA_PREFIX: accounts/${{ matrix.account }}
       C4_MAX_RUNTIME_MIN: "335"
       # Webhook + player_id come from accounts/<name>/config.json in the private repo.
-      # Do NOT set C4_PLAYER_ID / DISCORD_WEBHOOK_URL here: they would apply to every account.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
