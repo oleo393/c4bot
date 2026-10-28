@@ -27,7 +27,7 @@ jobs:
           import json, os
           # EDIT HERE: your accounts and how many sessions each can run ("" = main session, "1", "2" = extra ones).
           # A session without a login state or without an entry under "slots" in its config simply exits.
-          ACCOUNTS = ["main", "alt", "mmain", "malt"]
+          ACCOUNTS = ["main", "alt", "mmain", "malt", "gmain", "galt"]
           SLOTS = ["", "1", "2"]
           import re
           picks = [x for x in re.split(r"[,\s|]+", os.environ.get("PICK", "").strip()) if x] or ["all"]
