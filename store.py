@@ -36,6 +36,14 @@ class Store:
         self._sha[path] = j["sha"]
         return base64.b64decode(j["content"])
 
+    def list_files(self, path=""):
+        """Names of the files directly inside `path`."""
+        r = requests.get(self._url(path).rstrip("/"), headers=self._h(), timeout=20)
+        if r.status_code == 404:
+            return []
+        r.raise_for_status()
+        return sorted(e["name"] for e in r.json() if e.get("type") == "file")
+
     def list_dirs(self, path=""):
         """Names of the sub-folders of `path` (e.g. the account folders under accounts/)."""
         r = requests.get(self._url(path).rstrip("/"), headers=self._h(), timeout=20)
@@ -43,6 +51,15 @@ class Store:
             return []
         r.raise_for_status()
         return sorted(e["name"] for e in r.json() if e.get("type") == "dir")
+
+    def put_once(self, path, data, message="bot update"):
+        """Single attempt (raises requests.HTTPError on 409/422 = somebody else wrote first). For read-merge-write loops."""
+        body = {"message": message, "content": base64.b64encode(data).decode()}
+        if self._sha.get(path):
+            body["sha"] = self._sha[path]
+        r = requests.put(self._url(path), headers=self._h(), json=body, timeout=30)
+        r.raise_for_status()
+        self._sha[path] = r.json()["content"]["sha"]
 
     def put(self, path, data, message="bot update"):
         """Create/update a file. Several accounts commit to the same repo at once, so a 409/422
