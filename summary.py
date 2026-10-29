@@ -135,15 +135,24 @@ def main():
     webhook = str(g.get("summary_webhook") or "").strip().strip("\"'")
     if not webhook.startswith("https://"):
         sys.exit("summary.json: 'summary_webhook' is empty or not a https:// Discord webhook URL. Nothing can be sent.")
+    def fail(msg):   # tell the summary channel too, so a broken report is never silent
+        try:
+            send(webhook, f"\u26A0\uFE0F Daily report not sent: {msg}")
+        except Exception:
+            pass
+        sys.exit(msg)
+
     accounts = g.get("accounts") or Store(prefix="accounts").list_dirs()   # optional override; default = every folder
     if not accounts:
-        sys.exit("No account folders found under accounts/ in the private repo.")
+        fail("No account folders found under accounts/ in the private repo.")
     tz = ZoneInfo(g.get("timezone") or "UTC")
     hour = int(g.get("summary_hour") or 0)
     now = datetime.now(tz)
 
     state = load_json(root, "summary_state.json", {})
     day = DATE_ARG or (now - timedelta(days=1)).date().isoformat()
+    print(f"now={now:%Y-%m-%d %H:%M} {g.get('timezone') or 'UTC'} · report day={day} · summary_hour={hour} · "
+          f"last_sent={state.get('last_sent')} · force={FORCE} · accounts={accounts}")
     if not FORCE:
         if now.hour < hour:
             print("Too early for today's report.")
@@ -173,7 +182,7 @@ def main():
         if sess:
             data[acc] = dict(sorted(sess.items(), key=lambda kv: session_order(kv[0])))
     if not data:
-        sys.exit("No stats files (stats.enc / stats-N.enc) found yet. Nothing to report.")
+        fail("No stats files (stats.enc / stats-N.enc) found in the account folders yet.")
 
     dh = ["", "P/L", "W", "L", "D", "V", "games", "balance"]
     ah = ["", "P/L", "W", "L", "D", "V"]
