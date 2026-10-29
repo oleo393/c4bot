@@ -93,15 +93,51 @@ def send(webhook, text):
     raise RuntimeError("Discord rate limit")
 
 
+def session_order(name):
+    """main < main-1 < main-2"""
+    base, _, n = name.partition("-")
+    return (base, int(n) if n.isdigit() else 0)
+
+
+def blank():
+    return {"pnl": 0, "w": 0, "l": 0, "d": 0, "v": 0, "u": 0, "g": 0}
+
+
+def add(a, b):
+    for k in a:
+        a[k] += b.get(k, 0)
+    return a
+
+
+def send_table(webhook, title, header, groups):
+    """groups = [[row, row, ...], ...] (an account row followed by its session rows). Splits into several messages
+    at group borders if one Discord message (2000 characters) would not hold everything."""
+    chunks, cur = [], []
+    for grp in groups:
+        trial = cur + grp
+        if len(table(trial, header)) > 1700 and cur:
+            chunks.append(cur)
+            cur = list(grp)
+        else:
+            cur = trial
+    if cur:
+        chunks.append(cur)
+    for i, ch in enumerate(chunks):
+        head = title if i == 0 else f"{title} (continued)"
+        send(webhook, f"{head}\n```\n" + table(ch, header) + "\n```")
+
+
 def main():
     root = Store(prefix="")
     if not root.enabled:
         sys.exit("C4_DATA_REPO / C4_DATA_TOKEN not set")
     g = load_json(root, "summary.json", {})
-    accounts = g.get("accounts") or Store(prefix="accounts").list_dirs()   # optional override; default = every folder
     webhook = str(g.get("summary_webhook") or "").strip().strip("\"'")
-    if not accounts or not webhook.startswith("https://"):
-        sys.exit("summary.json needs a valid 'summary_webhook' and at least one folder under accounts/")
+    if not webhook.startswith("https://"):
+        sys.exit("summary.json: 'summary_webhook' is empty or not a https:// Discord webhook URL. Nothing can be sent.")
+    accounts = g.get("accounts") or Store(prefix="accounts").list_dirs()   # optional override; default = every folder
+    if not accounts:
+        sys.exit("No account folders found under accounts/ in the private repo.")
     tz = ZoneInfo(g.get("timezone") or "UTC")
     hour = int(g.get("summary_hour") or 0)
     now = datetime.now(tz)
@@ -116,39 +152,64 @@ def main():
             print("Already sent the report for", day)
             return
 
-    rows_day, rows_all, tot_d = [], [], {"pnl": 0, "g": 0, "w": 0, "l": 0, "d": 0}
-    tot_all = {"pnl": 0, "w": 0, "l": 0, "d": 0}
-    acct_bal, any_bal = {}, False
-    sessions = [x for acc in accounts for x in sessions_of(acc)]
-    for name, (acc, fname) in [(n, (n.split("-")[0], f)) for n, f in sessions]:
-        try:
-            st = load_stats(acc, fname)
-        except Exception as e:
-            print("stats load failed for", name, type(e).__name__)
-            st = {}
-        d = day_totals(st, day, tz)
-        rec = st.get("rec") or {}
-        bal = st.get("balance")
-        rows_day.append([name, fmt_signed(d["pnl"]), d["w"], d["l"], d["d"], d["g"], fmt(bal) if bal is not None else "n/a"])
-        rows_all.append([name, fmt_signed(st.get("pnl", 0)), rec.get("w", 0), rec.get("l", 0), rec.get("d", 0)])
-        for f in tot_d:
-            tot_d[f] += d[f]
-        tot_all["pnl"] += st.get("pnl", 0)
-        for f in ("w", "l", "d"):
-            tot_all[f] += rec.get(f, 0)
-        if bal is not None:   # sessions of one account share ONE balance: keep the most recent reading per account
-            any_bal = True
-            at = st.get("balance_at") or ""
-            if acc not in acct_bal or at >= acct_bal[acc][0]:
-                acct_bal[acc] = (at, bal)
-    tot_bal = sum(v for _, v in acct_bal.values())
-    rows_day.append(["TOTAL", fmt_signed(tot_d["pnl"]), tot_d["w"], tot_d["l"], tot_d["d"], tot_d["g"], fmt(tot_bal) if any_bal else "n/a"])
-    rows_all.append(["TOTAL", fmt_signed(tot_all["pnl"]), tot_all["w"], tot_all["l"], tot_all["d"]])
+    # ---- collect: per account -> per session
+    data = {}
+    for acc in accounts:
+        sess = {}
+        for name, fname in sessions_of(acc):
+            try:
+                st = load_stats(acc, fname)
+            except Exception as e:
+                print("stats load failed for", name, type(e).__name__)
+                st = {}
+            d = day_totals(st, day, tz)
+            rec = st.get("rec") or {}
+            sess[name] = {
+                "day": d,
+                "all": {"pnl": st.get("pnl", 0), "w": rec.get("w", 0), "l": rec.get("l", 0), "d": rec.get("d", 0),
+                        "v": rec.get("v", 0), "u": rec.get("u", 0),
+                        "g": sum(rec.get(k, 0) for k in ("w", "l", "d", "v", "u"))},
+                "bal": st.get("balance"), "bal_at": st.get("balance_at") or ""}
+        if sess:
+            data[acc] = dict(sorted(sess.items(), key=lambda kv: session_order(kv[0])))
+    if not data:
+        sys.exit("No stats files (stats.enc / stats-N.enc) found yet. Nothing to report.")
 
-    send(webhook, f"\U0001F4CA **Daily report** · {day} ({g.get('timezone') or 'UTC'})\n"
-                  "```\n" + table(rows_day, ["", "P/L", "W", "L", "D", "games", "balance"]) + "\n```")
-    send(webhook, "**All-time** (since last P/L reset)\n"
-                  "```\n" + table(rows_all, ["", "P/L", "W", "L", "D"]) + "\n```")
+    dh = ["", "P/L", "W", "L", "D", "V", "games", "balance"]
+    ah = ["", "P/L", "W", "L", "D", "V"]
+    day_groups, all_groups = [], []
+    tot_day, tot_all, tot_bal, any_bal = blank(), blank(), 0, False
+    for acc, sess in data.items():
+        a_day, a_all = blank(), blank()
+        bal, bal_at = None, ""
+        for v in sess.values():
+            add(a_day, v["day"])
+            add(a_all, v["all"])
+            if v["bal"] is not None and v["bal_at"] >= bal_at:   # sessions share ONE balance: latest reading wins
+                bal, bal_at = v["bal"], v["bal_at"]
+        add(tot_day, a_day)
+        add(tot_all, a_all)
+        if bal is not None:
+            tot_bal += bal
+            any_bal = True
+        multi = len(sess) > 1
+        label = f"{acc} (all)" if multi else acc
+        row_d = lambda n, t, b="": [n, fmt_signed(t["pnl"]), t["w"], t["l"], t["d"], t["v"], t["g"], b]
+        row_a = lambda n, t: [n, fmt_signed(t["pnl"]), t["w"], t["l"], t["d"], t["v"]]
+        gd = [row_d(label, a_day, fmt(bal) if bal is not None else "n/a")]
+        ga = [row_a(label, a_all)]
+        if multi:   # breakdown per session
+            for name, v in sess.items():
+                gd.append(row_d("  " + name, v["day"]))
+                ga.append(row_a("  " + name, v["all"]))
+        day_groups.append(gd)
+        all_groups.append(ga)
+    day_groups.append([["OVERALL", fmt_signed(tot_day["pnl"]), tot_day["w"], tot_day["l"], tot_day["d"], tot_day["v"],
+                        tot_day["g"], fmt(tot_bal) if any_bal else "n/a"]])
+    all_groups.append([["OVERALL", fmt_signed(tot_all["pnl"]), tot_all["w"], tot_all["l"], tot_all["d"], tot_all["v"]]])
+
+    send_table(webhook, f"\U0001F4CA **Daily report** \u00b7 {day} ({g.get('timezone') or 'UTC'})", dh, day_groups)
+    send_table(webhook, "**All-time** (since the last P/L reset)", ah, all_groups)
     print("Report sent for", day)
     if not FORCE:
         state["last_sent"] = day
