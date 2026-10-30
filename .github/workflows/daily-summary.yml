@@ -1,5 +1,7 @@
 name: daily-summary
 
+# Started from outside by cron-job.org once a day (HTTP POST to the workflow_dispatch API), not by GitHub's own schedule.
+# summary.py sends the report only at/after summary_hour (summary.json) and only once per day, so an extra call is harmless.
 on:
   workflow_dispatch:
     inputs:
@@ -7,8 +9,6 @@ on:
         description: "Send the report now (for yesterday), ignoring the once-a-day guard"
         type: boolean
         default: false
-  schedule:
-    - cron: "17 * * * *"    # hourly check; summary.py sends only once per day (see summary.json)
 
 permissions:
   contents: write           # only for the keep-alive step below
@@ -32,7 +32,7 @@ jobs:
       - run: pip install requests cryptography
       - name: Send report
         run: python summary.py ${{ inputs.force && '--force' || '' }}
-      - name: Keep scheduled runs alive (public repos pause them after 60 days without commits)
+      - name: Keep connect4-bot's schedule alive (public repos pause scheduled workflows after 60 days without commits)
         if: always()
         run: |
           last=$(git log -1 --format=%ct); now=$(date +%s)
