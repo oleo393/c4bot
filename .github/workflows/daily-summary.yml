@@ -11,7 +11,7 @@ on:
         default: false
 
 permissions:
-  contents: write           # only for the keep-alive step below
+  contents: read
 
 concurrency:
   group: daily-summary
@@ -32,11 +32,3 @@ jobs:
       - run: pip install requests cryptography
       - name: Send report
         run: python summary.py ${{ inputs.force && '--force' || '' }}
-      - name: Keep connect4-bot's schedule alive (public repos pause scheduled workflows after 60 days without commits)
-        if: always()
-        run: |
-          last=$(git log -1 --format=%ct); now=$(date +%s)
-          if [ $(( (now - last) / 86400 )) -ge 30 ]; then
-            git config user.name "c4bot"; git config user.email "c4bot@users.noreply.github.com"
-            git commit --allow-empty -m "keepalive" && git push
-          fi
