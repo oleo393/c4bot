@@ -1,14 +1,15 @@
 name: connect4-bot
 
+# Started from outside by cron-job.org (HTTP POST to the workflow_dispatch API), not by GitHub's own schedule.
+# Call it every hour with {"ref":"main"}: every call queues a new run behind the running one (one run per session at a
+# time, see the concurrency group), so the sessions are restarted as soon as the previous job ends.
 on:
-  workflow_dispatch:        # "Run workflow" button (collaborators only)
+  workflow_dispatch:        # cron-job.org and the "Run workflow" button
     inputs:
       runner:
         description: "One or more, separated by commas: all, main, main-1, alt* (alt* = every session of alt)"
         type: string
         default: all
-  schedule:
-    - cron: "7 * * * *"     # hourly; a session exits quietly if it is disabled / not configured in its private config
 
 permissions:
   contents: read
@@ -46,7 +47,6 @@ jobs:
   play:
     needs: plan
     name: ${{ matrix.name }}
-    if: github.repository_owner == github.actor || github.event_name == 'schedule'
     runs-on: ubuntu-latest          # one fresh 4 vCPU / 16 GB VM per session
     timeout-minutes: 355
     strategy:
