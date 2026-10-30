@@ -151,8 +151,8 @@ def main():
 
     state = load_json(root, "summary_state.json", {})
     day = DATE_ARG or (now - timedelta(days=1)).date().isoformat()
-    print(f"now={now:%Y-%m-%d %H:%M} {g.get('timezone') or 'UTC'} · report day={day} · summary_hour={hour} · "
-          f"last_sent={state.get('last_sent')} · force={FORCE} · accounts={accounts}")
+    print(f"now={now:%Y-%m-%d %H:%M} {g.get('timezone') or 'UTC'} \u00b7 report day={day} \u00b7 summary_hour={hour} \u00b7 "
+          f"last_sent={state.get('last_sent')} \u00b7 force={FORCE} \u00b7 accounts={accounts}")
     if not FORCE:
         if now.hour < hour:
             print("Too early for today's report.")
