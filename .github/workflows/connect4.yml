@@ -63,6 +63,8 @@ jobs:
       C4_SLOT: ${{ matrix.slot }}
       C4_DATA_PREFIX: accounts/${{ matrix.account }}
       C4_MAX_RUNTIME_MIN: "335"
+      C4_IMAP_USER: ${{ secrets.C4_IMAP_USER }}          # Yahoo address that receives the DonutFlip code mails
+      C4_IMAP_PASSWORD: ${{ secrets.C4_IMAP_PASSWORD }}  # Yahoo APP password (not the normal password)
       # Webhook + player_id come from accounts/<name>/config.json in the private repo.
     steps:
       - uses: actions/checkout@v4

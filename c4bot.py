@@ -12,6 +12,7 @@ from pathlib import Path
 
 import requests
 from store import Store
+import autologin
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 try:
@@ -20,7 +21,7 @@ except Exception:
     pass
 
 HERE = Path(__file__).resolve().parent
-CODE_REV = "2026-10-28-slots+claims+nowindow+cfcycle+headed"   # shown in the debug log (ENV line) so you can tell which code ran
+CODE_REV = "2026-10-30-slots+claims+nowindow+cfcycle+headed+autologin2"   # shown in the debug log (ENV line) so you can tell which code ran
 HEADLESS = "--headed" not in sys.argv
 LOBBY_URL = "https://donutflip.net/connect-four"
 HOME_URL = "https://donutflip.net/"
@@ -63,6 +64,8 @@ DEFAULT_CFG = {
     "human_steps": 3,           # mouse-move steps of the human click (each step costs ~0.25 s on a busy runner)
     "click_mode": "fast",       # "fast" = one in-page click (like the old extension), "human" = scroll + mouse path (slow: ~0.25 s per mouse step on the runner)
     "webhook": "",              # this account's Discord webhook (private repo only); falls back to the DISCORD_WEBHOOK_URL env / .secret
+    "auto_login": False,        # true = log in again by e-mail code when the saved session expired (needs login_email + login.json)
+    "login_email": "",          # the address this DonutFlip account signs in with (the duck.com alias); same for all sessions
     "debug": 0,                 # 0 = off, 1 = timing log sent to the private Discord webhook after each game, 2 = also print to stdout
 }
 
@@ -96,9 +99,9 @@ class NoWindow(Exception):
 
 
 class BotError(Exception):
-    def __init__(self, msg, shot=None, fatal=False, blocked=False, limit=False):
+    def __init__(self, msg, shot=None, fatal=False, blocked=False, limit=False, logged_out=False):
         super().__init__(msg)
-        self.shot, self.fatal, self.blocked, self.limit = shot, fatal, blocked, limit
+        self.shot, self.fatal, self.blocked, self.limit, self.logged_out = shot, fatal, blocked, limit, logged_out
 
 
 # ---------------------------------------------------------------- helpers
@@ -389,7 +392,7 @@ def get_cfg():
                 WEBHOOK = hook
         except Exception as e:
             if not _cfg_warned:
-                notify(f"‚ö†Ô∏è config.json is invalid ({e}). Keeping the last good settings.")
+                notify(f"?? config.json is invalid ({e}). Keeping the last good settings.")
                 _cfg_warned = True
     return _last_cfg
 
@@ -450,7 +453,7 @@ def record_game(stats, outcome, profit, unknown):
         del stats["hourly"][k]
 
 
-def prepare_state():
+def prepare_state(allow_empty=False):
     """Create storage_state.json from the private repo's state.enc (preferred), a local state.enc,
     or the STATE_JSON secret. Returns a hash of the source."""
     f = _fernet()
@@ -473,6 +476,9 @@ def prepare_state():
         return hashlib.sha256(sec.encode()).hexdigest()
     if STATE_FILE.exists():  # local use
         return hashlib.sha256(STATE_FILE.read_bytes()).hexdigest()
+    if allow_empty:   # auto-login is on: start without cookies, the bot logs in by e-mail code
+        STATE_FILE.write_text('{"cookies": [], "origins": []}', encoding="utf-8")
+        return "empty-state"
     sys.exit("No login state: put state.enc in the private data repo + STATE_KEY, or set the STATE_JSON secret (see README).")
 
 
@@ -651,7 +657,7 @@ def open_lobby(sess):
         if wait_logged_in(page):
             return read_balance(page)
     if page.locator(SIGN_IN).count() > 0 and not is_challenge(page):
-        raise BotError("Logged out: the site shows 'Sign In'.", shot(page), fatal=True)
+        raise BotError("Logged out: the site shows 'Sign In'.", shot(page), fatal=True, logged_out=True)
     raise BotError(f"Page did not finish loading (title: '{page_title(page)}').", shot(page), blocked=True)
 
 
@@ -898,8 +904,8 @@ def close_session(sess):
         return
     if sess.listing:
         ok = cancel_listing(sess)
-        notify("üßπ Cancelled the unjoined listing." if ok else
-               "‚ö†Ô∏è Could not cancel the unjoined listing. Please cancel it on the site by hand.")
+        notify("?? Cancelled the unjoined listing." if ok else
+               "?? Could not cancel the unjoined listing. Please cancel it on the site by hand.")
     sess.close()
 
 
@@ -1101,9 +1107,9 @@ def never_saw_error(sess):
     bad = [st for st, _, ts in sess.api_bad if time.time() - ts < 180]
     cf = is_challenge(page) or any(st in (403, 429, 503) for st in bad)
     return BotError("Created a game but never saw it in the API"
-                    + (f" ¬∑ API errors in the last 3 min: {bad[-6:]}" if bad else " ¬∑ no API errors seen")
-                    + (f" ¬∑ page title '{page_title(page)}'" if cf else "")
-                    + (" ¬∑ treating this as a Cloudflare block (slow backoff retry)." if cf else
+                    + (f" °§ API errors in the last 3 min: {bad[-6:]}" if bad else " °§ no API errors seen")
+                    + (f" °§ page title '{page_title(page)}'" if cf else "")
+                    + (" °§ treating this as a Cloudflare block (slow backoff retry)." if cf else
                        ". If 'viewer' is missing from the API response, set player_id in this account's config.json."),
                     shot(page), blocked=cf)
 
@@ -1345,6 +1351,91 @@ def play_game(sess, solver, wait_s):
 
 
 # ---------------------------------------------------------------- main loop
+# ---------------------------------------------------------------- automatic login (e-mail code, see autologin.py)
+_login_cache = {"at": 0.0, "data": {}}
+_used_codes = set()
+LOGIN_LOCK = "login-lock.json"
+
+
+def login_creds():
+    """login.json from the private repo root (cached 5 min) + environment overrides."""
+    if time.time() - _login_cache["at"] > 300:
+        _login_cache.update(at=time.time(), data=autologin.load_creds(store_root=Store(prefix="") if STORE.enabled else None))
+    return _login_cache["data"]
+
+
+def auto_login_on(cfg):
+    d = login_creds()
+    return bool(cfg.get("auto_login")) and d.get("enabled", True) is not False and bool(str(cfg.get("login_email") or "").strip()) \
+        and bool(d.get("imap_user")) and bool(d.get("imap_password"))
+
+
+def notify_login(msg, screenshot=None):
+    """Login feedback goes to its own webhook (login.json 'login_webhook'), never to the account webhook."""
+    hook = str(login_creds().get("login_webhook") or "").strip().strip("\"'")
+    print("[login] message sent" if IN_ACTIONS else f"[login] {msg}", flush=True)
+    if hook.startswith("https://"):
+        autologin.post_discord(hook, f"{LABEL}{msg}", screenshot)
+
+
+def _lock_body(owner):
+    # the lock file also remembers the codes already used, so the next session never types a code from the previous login
+    return (json.dumps({"owner": owner, "ts": time.time() if owner else 0, "used": sorted(_used_codes)[-20:]}) + "\n").encode()
+
+
+def login_lock_acquire(timeout=900):
+    """Sessions of one account share one mailbox address: ONE session logs in at a time, the others wait their turn
+    (a login takes ~1-2 min; three sessions need a few minutes). Waiting is not a failure."""
+    if CSTORE is None:
+        return True
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        try:
+            blob = CSTORE.get(LOGIN_LOCK)
+            d = json.loads(blob.decode("utf-8-sig")) if blob else {}
+            _used_codes.update(str(c) for c in (d.get("used") or []))
+            if (not d.get("owner")) or d.get("owner") == ME or time.time() - float(d.get("ts") or 0) > 480:
+                CSTORE.put_once(LOGIN_LOCK, _lock_body(ME), "login lock")
+                time.sleep(1.5)
+                blob = CSTORE.get(LOGIN_LOCK)
+                if blob and json.loads(blob.decode("utf-8-sig")).get("owner") == ME:
+                    return True
+        except Exception:
+            pass
+        time.sleep(random.uniform(3, 7))
+    return False
+
+
+def login_lock_release():
+    if CSTORE is None:
+        return
+    for _ in range(3):
+        try:
+            CSTORE.get(LOGIN_LOCK)
+            CSTORE.put_once(LOGIN_LOCK, _lock_body(None), "login lock released")
+            return
+        except Exception:
+            time.sleep(1)
+
+
+def do_auto_login(sess, cfg):
+    """True = logged in (the caller saves the session), False = failed, None = still waiting for the other sessions' turn."""
+    addr = str(cfg.get("login_email") or "").strip()
+    if not login_lock_acquire():
+        return None
+    try:
+        autologin.login_flow(sess.page, addr, login_creds(), used_codes=_used_codes,
+                             log=lambda m: print("[login]", m, flush=True))
+        return True
+    except autologin.LoginError as ex:
+        notify_login(f"\u274C Auto-login failed: {ex}", shot(sess.page))
+    except Exception as ex:
+        notify_login(f"\u274C Auto-login error: {type(ex).__name__}: {str(ex)[:200]}", shot(sess.page))
+    finally:
+        login_lock_release()
+    return False
+
+
 class Stop(Exception):
     pass
 
@@ -1360,8 +1451,9 @@ def main():
     stats = load_stats()
     stats.setdefault("pnl", 0)
     stats.setdefault("rec", {"w": 0, "l": 0, "d": 0, "v": 0, "u": 0})
-    src_hash = prepare_state()
-    if stats.get("dead_hash") == src_hash:
+    al_on = auto_login_on(cfg)
+    src_hash = prepare_state(allow_empty=al_on)
+    if stats.get("dead_hash") == src_hash and not al_on:
         print("Login state is known to be logged out and has not been replaced. Exiting quietly.")
         return 0
     stats.pop("dead_hash", None)
@@ -1378,13 +1470,14 @@ def main():
             node_v = "?"
         dlog("ENV", rev=CODE_REV, python=sys.version.split()[0], node=node_v, cpus=os.cpu_count(), load=os.getloadavg(), actions=int(IN_ACTIONS),
              safe_remaining_s=cfg["safe_remaining_s"], min_delay_ms=cfg["min_delay_ms"], solver_total_ms=7000, tt_bits=24)
-    notify(f"‚ñ∂Ô∏è {LABEL}Connect 4 bot started ¬∑ {now_str()} ¬∑ rev {CODE_REV}\nBooks: {solver.books}\n"
-           f"Stake {fmt(parse_amount(cfg['stake']))} ¬∑ seat {cfg['seat']} ¬∑ P/L so far {fmt_signed(stats['pnl'])}")
+    notify(f"?? {LABEL}Connect 4 bot started °§ {now_str()} °§ rev {CODE_REV}\nBooks: {solver.books}\n"
+           f"Stake {fmt(parse_amount(cfg['stake']))} °§ seat {cfg['seat']} °§ P/L so far {fmt_signed(stats['pnl'])}")
     games = errors = 0
     blocked_n, blocked_since = 0, None
     limit_n = 0
     skip_reload = False
     no_win_n = 0
+    login_fail_n = 0
 
     def nap(seconds):
         """Sleep, but wake up to honour 'enabled: false' and the runtime limit. False = stop now."""
@@ -1426,7 +1519,7 @@ def main():
                     if not lobby_ready and not skip_reload:
                         bal = open_lobby(sess)
                         if blocked_n:
-                            notify(f"‚úÖ Cloudflare cleared after {blocked_n} retries "
+                            notify(f"? Cloudflare cleared after {blocked_n} retries "
                                    f"({(time.monotonic() - blocked_since) / 60:.0f} min). Resuming.")
                             blocked_n, blocked_since = 0, None
                     lobby_ready = False
@@ -1461,7 +1554,7 @@ def main():
                     dflush(f"after game {games + 1}")
                     if result is None:
                         ok = cancel_listing(sess)      # never leave an unjoined listing behind
-                        notify("‚åõ Stopped waiting for an opponent ¬∑ " +
+                        notify("? Stopped waiting for an opponent °§ " +
                                ("listing cancelled." if ok else "COULD NOT CANCEL the listing, check the site."))
                         lobby_ready = False
                         continue
@@ -1490,17 +1583,50 @@ def main():
                         bal, lobby_ready = None, False   # blocked: the next loop retries with backoff
                     ne = int(cfg["notify_every"] or 0)
                     if ne and games % ne == 0:
-                        notify(f"üéÆ **{outcome.upper()}{'?' if unknown else ''}** {fmt_signed(profit)} ¬∑ stake {fmt(stake)} ¬∑ {now_str()}\n"
+                        notify(f"?? **{outcome.upper()}{'?' if unknown else ''}** {fmt_signed(profit)} °§ stake {fmt(stake)} °§ {now_str()}\n"
                                f"Balance: {fmt(bal) if bal is not None else 'unknown (page blocked)'}\n"
-                               f"P/L: {fmt_signed(stats['pnl'])} ¬∑ {rec['w']}W {rec['l']}L {rec['d']}D"
-                               + (f" {rec['u']}?" if rec['u'] else "") + f" ¬∑ games this run: {games}")
+                               f"P/L: {fmt_signed(stats['pnl'])} °§ {rec['w']}W {rec['l']}L {rec['d']}D"
+                               + (f" {rec['u']}?" if rec['u'] else "") + f" °§ games this run: {games}")
                     time.sleep(END_BUFFER_S)
 
                 except BotError as e:
+                    if e.logged_out and auto_login_on(cfg):
+                        wait_left = stats.get("login_retry_after", 0) - time.time()
+                        if wait_left > 0:
+                            notify_login(f"\u23F8\uFE0F Auto-login is paused for {int(wait_left / 60) + 1} more min after repeated failures; this session stays off.")
+                            exit_code, reason = 2, "logged out (auto-login paused)"
+                            break
+                        notify_login("\u26A0\uFE0F Session expired. Logging in automatically (one session of this account at a time)...")
+                        res = do_auto_login(sess, cfg)
+                        if res is None:
+                            notify_login("\u23F3 Other sessions of this account kept the login busy for 15 min; waiting and trying again.")
+                            if not nap(60):
+                                reason = "stopped while waiting for the login turn"
+                                break
+                            continue
+                        if res:
+                            stats.pop("dead_hash", None)
+                            stats.pop("login_retry_after", None)
+                            login_fail_n = 0
+                            save_state(sess.ctx)
+                            notify_login("\u2705 Logged in automatically. New session saved.")
+                            lobby_ready = False
+                            continue
+                        login_fail_n += 1
+                        if login_fail_n < 3:
+                            close_session(sess); sess = None        # fresh browser, then try again
+                            if not nap(120):
+                                reason = "stopped while waiting to retry the login"
+                                break
+                            continue
+                        stats["login_retry_after"] = time.time() + 3600
+                        notify_login("\U0001F6D1 Automatic login failed 3 times. Paused for 60 min; this session stops for this run.")
+                        exit_code, reason = 2, "logged out (auto-login failed)"
+                        break
                     if e.limit:
                         limit_n += 1
                         if limit_n == 1 or limit_n % 10 == 0:
-                            notify(f"‚è≥ {LABEL}{e}. Waiting for a slot to free up; retrying about every minute.")
+                            notify(f"? {LABEL}{e}. Waiting for a slot to free up; retrying about every minute.")
                         if not nap(random.uniform(45, 75)):
                             reason = "stopped while waiting for a free listing slot"
                             break
@@ -1513,12 +1639,12 @@ def main():
                         wait_min = steps[idx] * random.uniform(0.9, 1.2)
                         blocked_for = (time.monotonic() - blocked_since) / 60
                         if blocked_for + wait_min > float(cfg["cf_give_up_min"]):
-                            notify(f"üõë {LABEL}Blocked by Cloudflare for {blocked_for:.0f} min. Giving up for this run; "
+                            notify(f"?? {LABEL}Blocked by Cloudflare for {blocked_for:.0f} min. Giving up for this run; "
                                    f"the next scheduled run will try again.", e.shot)
                             exit_code, reason = 1, "blocked by Cloudflare"
                             break
                         if blocked_n == 1 or blocked_n % 3 == 0:
-                            notify(f"üõ°Ô∏è Blocked ({e}) ¬∑ attempt {blocked_n}. Retrying in {wait_min:.0f} min.",
+                            notify(f"??? Blocked ({e}) °§ attempt {blocked_n}. Retrying in {wait_min:.0f} min.",
                                    e.shot if blocked_n == 1 else None)
                         close_session(sess); sess = None   # fresh browser for the next try
                         lobby_ready = False
@@ -1526,16 +1652,16 @@ def main():
                             reason = "stopped while waiting out a block"
                             break
                         continue
-                    notify(f"‚ùå {LABEL}**Error** ¬∑ {now_str()}\n{e}", e.shot)
+                    notify(f"? {LABEL}**Error** °§ {now_str()}\n{e}", e.shot)
                     if e.fatal:
                         stats["dead_hash"] = src_hash
-                        notify(f"üîë {LABEL}**Login state is dead. Reload it:** run `python login.py {(ACCOUNT + SFX) or '<name>'} --encrypt` on your PC "
+                        notify(f"?? {LABEL}**Login state is dead. Reload it:** run `python login.py {(ACCOUNT + SFX) or '<name>'} --encrypt` on your PC "
                                "(Chrome open with --remote-debugging-port=9222 and logged in), then upload the new "
                                "`state.enc` to the private data repo. The bot stays quiet until the state changes.")
                         exit_code, reason = 2, "logged out"; break
                     errors += 1
                 except Exception as e:
-                    notify(f"‚ùå {LABEL}**Unexpected error** ¬∑ {now_str()}\n{type(e).__name__}: {e}",
+                    notify(f"? {LABEL}**Unexpected error** °§ {now_str()}\n{type(e).__name__}: {e}",
                            shot(sess.page) if sess else None)
                     errors += 1
 
@@ -1551,8 +1677,8 @@ def main():
             try:
                 if sess.listing:           # terminated while waiting for an opponent: cancel the listing first
                     ok = cancel_listing(sess)
-                    notify("üßπ Cancelled the unjoined listing before stopping." if ok else
-                           "‚ö†Ô∏è Could not cancel the unjoined listing. Please cancel it on the site by hand.")
+                    notify("?? Cancelled the unjoined listing before stopping." if ok else
+                           "?? Could not cancel the unjoined listing. Please cancel it on the site by hand.")
             except BaseException:
                 pass
             if exit_code != 2 and not errors:
@@ -1561,7 +1687,7 @@ def main():
         save_stats(stats)
         solver.close()
         dflush("exit")
-        notify(f"‚èπÔ∏è {LABEL}Connect 4 bot {reason} ¬∑ games this run: {games} ¬∑ P/L {fmt_signed(stats['pnl'])}")
+        notify(f"?? {LABEL}Connect 4 bot {reason} °§ games this run: {games} °§ P/L {fmt_signed(stats['pnl'])}")
     return exit_code
 
 
