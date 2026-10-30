@@ -23,7 +23,7 @@ HOME_URL = "https://donutflip.net/"
 SIGN_IN = "header.site-navbar button:text-is('Sign In')"
 BALANCE = "header.site-navbar button.nav-coin-pill > span"
 DIALOG = "div[role='dialog'][aria-labelledby='signup-flow-title']"
-SUBJECT_RE = re.compile(r"(\d{6})\s+is your DonutFlip email code", re.I)
+SUBJECT_RE = re.compile(r"\b(\d{6})\s+is your DonutFlip\b[^\n]*?\bcode", re.I)   # "123456 is your DonutFlip code" (sign-in) and "... email code" (settings)
 FOLDERS = ("INBOX", "Bulk Mail", "Bulk", "Spam")      # Yahoo's junk folder is called "Bulk" / "Bulk Mail"
 DATE_MARGIN_S = 10                                    # mail Date may be slightly before our click (clock skew)
 
@@ -83,13 +83,24 @@ def address_pattern(addr):
     return re.compile(r"(?<![a-z0-9.\-])" + re.escape(addr.strip().lower()))
 
 
-def match_code(msg, pat, since_utc, exclude=()):
-    """-> (code, mail date) if this message is a DonutFlip code mail for our address that is not older than `since_utc`."""
-    m = SUBJECT_RE.search(_h(msg.get("Subject")))
-    if not m or m.group(1) in exclude:
-        return None
+def explain_message(msg, pat, exclude=()):
+    """-> (code or None, reason). Does not look at the mail date: 'new' is decided by the mailbox UID (see below)."""
+    subj = _h(msg.get("Subject"))
+    m = SUBJECT_RE.search(subj)
+    if not m:
+        return None, "subject is not a DonutFlip code mail"
     blob = " ".join(_h(msg.get(k)) for k in ("From", "To", "Duck-Original-To", "Delivered-To", "X-Original-To")).lower()
     if not pat.search(blob):
+        return None, "code mail for a different address"
+    if m.group(1) in exclude:
+        return None, "code already used"
+    return m.group(1), "ok"
+
+
+def match_code(msg, pat, since_utc, exclude=()):
+    """Date-based variant (kept for tests / fallback): (code, mail date) if newer than `since_utc`."""
+    code, _ = explain_message(msg, pat, exclude)
+    if not code:
         return None
     dt = None
     try:
@@ -99,28 +110,76 @@ def match_code(msg, pat, since_utc, exclude=()):
         if dt < since_utc - timedelta(seconds=DATE_MARGIN_S):
             return None
     except Exception:
-        pass   # unreadable Date: accept it, the newest mail is checked first
-    return m.group(1), dt
+        pass
+    return code, dt
 
 
-def _scan_mailbox(creds, pat, since_utc, exclude):
+def _connect(creds):
     M = imaplib.IMAP4_SSL(creds.get("imap_host") or "imap.mail.yahoo.com", 993, timeout=30)
     try:
         M.login(creds["imap_user"], creds["imap_password"])
+    except imaplib.IMAP4.error:
+        try:
+            M.logout()
+        except Exception:
+            pass
+        raise LoginError("IMAP login failed: check C4_IMAP_USER (full Yahoo address) and C4_IMAP_PASSWORD (Yahoo APP password)")
+    return M
+
+
+def _uids(M, folder):
+    """UIDs of the folder (ascending) or None if the folder does not exist."""
+    typ, _ = M.select(f'"{folder}"', readonly=True)
+    if typ != "OK":
+        return None
+    typ, data = M.uid("SEARCH", None, "ALL")
+    if typ != "OK" or not data or not data[0]:
+        return []
+    return sorted(int(x) for x in data[0].split())
+
+
+def mailbox_baseline(creds):
+    """Highest message UID per folder BEFORE the code is requested. Every mail with a higher UID arrived afterwards, so
+    no clock comparison between this machine and the mail server is needed. Also proves the IMAP login works."""
+    M = _connect(creds)
+    base = {}
+    try:
         for folder in FOLDERS:
-            typ, _ = M.select(f'"{folder}"', readonly=True)
-            if typ != "OK":
+            u = _uids(M, folder)
+            if u is not None:
+                base[folder] = u[-1] if u else 0
+    finally:
+        try:
+            M.logout()
+        except Exception:
+            pass
+    if "INBOX" not in base:
+        raise LoginError("the Yahoo mailbox has no INBOX folder over IMAP?")
+    return base
+
+
+def _mask(text):
+    return re.sub(r"\d", "#", text or "")[:70]
+
+
+def _scan(creds, pat, base, exclude, seen):
+    M = _connect(creds)
+    try:
+        for folder, b in base.items():
+            uids = _uids(M, folder)
+            if uids is None:
                 continue
-            typ, data = M.search(None, "SINCE", (since_utc - timedelta(days=1)).strftime("%d-%b-%Y"))
-            if typ != "OK" or not data or not data[0]:
-                continue
-            for mid in reversed(data[0].split()[-25:]):     # newest first
-                typ, md = M.fetch(mid, "(BODY.PEEK[HEADER])")
+            new = [u for u in uids if u > b]
+            seen[folder] = max(seen.get(folder, 0), len(new))
+            for u in reversed(new[-15:]):                     # newest first
+                typ, md = M.uid("FETCH", str(u), "(BODY.PEEK[HEADER])")
                 if typ != "OK" or not md or not isinstance(md[0], tuple):
                     continue
-                hit = match_code(email.message_from_bytes(md[0][1]), pat, since_utc, exclude)
-                if hit:
-                    return hit[0]
+                msg = email.message_from_bytes(md[0][1])
+                code, why = explain_message(msg, pat, exclude)
+                if code:
+                    return code
+                seen.setdefault("_why", {})[(folder, u)] = f"{folder}: '{_mask(_h(msg.get('Subject')))}' -> {why}"
         return None
     finally:
         try:
@@ -129,26 +188,26 @@ def _scan_mailbox(creds, pat, since_utc, exclude):
             pass
 
 
-def fetch_code(creds, addr, since_ts, timeout=150, exclude=(), interval=4, log=print):
-    """Wait for the code mail sent after `since_ts` (epoch seconds) to `addr`. Raises LoginError on timeout / bad IMAP login."""
-    since = datetime.fromtimestamp(since_ts, timezone.utc)
+def fetch_code(creds, addr, base, timeout=150, exclude=(), interval=4, log=print):
+    """Wait for a DonutFlip code mail for `addr` that arrived after `base` (see mailbox_baseline)."""
     pat = address_pattern(addr)
-    end, tries, last = time.monotonic() + timeout, 0, None
+    end, tries, last, seen = time.monotonic() + timeout, 0, None, {}
     while time.monotonic() < end:
         tries += 1
         try:
-            code = _scan_mailbox(creds, pat, since, exclude)
+            code = _scan(creds, pat, base, exclude, seen)
             if code:
                 log(f"code mail found after {tries} poll(s)")
                 return code
-        except imaplib.IMAP4.error as e:
-            if "AUTHENTICATIONFAILED" in str(e).upper() or "LOGIN" in str(e).upper():
-                raise LoginError("IMAP login failed: check imap_user and the Yahoo APP password")
-            last = e
+        except LoginError:
+            raise
         except Exception as e:
             last = e
         time.sleep(interval)
-    raise LoginError(f"no code mail for this address within {timeout}s" + (f" (last mailbox error: {type(last).__name__})" if last else ""))
+    news = {k: v for k, v in seen.items() if k != "_why"}
+    why = list(seen.get("_why", {}).values())[-5:]
+    raise LoginError(f"no code mail for this address within {timeout}s. New mails seen per folder: {news or 'none'}. "
+                     f"Rejected: {why or 'none'}" + (f". Last mailbox error: {type(last).__name__}" if last else ""))
 
 
 # ---------------------------------------------------------------- browser flow
@@ -196,9 +255,27 @@ def login_flow(page, addr, creds, used_codes=None, log=print):
         log("already logged in")
         return True
 
-    page.locator(SIGN_IN).first.click(timeout=10000)
+    try:   # the header button is grayed out / has no handler until the page has finished loading
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        pass
+    page.wait_for_timeout(1500)
     dlg = page.locator(DIALOG)
-    dlg.wait_for(state="visible", timeout=15000)
+    opened = False
+    for attempt in range(1, 8):
+        try:
+            btn = page.locator(SIGN_IN).first
+            btn.wait_for(state="visible", timeout=15000)
+            _wait_enabled(page, btn, 15, "header 'Sign In'")
+            btn.click(timeout=8000)
+            dlg.wait_for(state="visible", timeout=4000)
+            opened = True
+            break
+        except Exception:
+            log(f"sign-in dialog not open yet (attempt {attempt}), waiting for the page")
+            page.wait_for_timeout(2500)
+    if not opened:
+        raise LoginError("the sign-in dialog did not open after 7 clicks (page not ready or blocked?)")
     log("sign-in dialog open")
 
     dlg.locator("button[role='tab']:has-text('Email')").first.click(timeout=8000)
@@ -221,13 +298,13 @@ def login_flow(page, addr, creds, used_codes=None, log=print):
 
     send = dlg.locator("button[type='submit']:has-text('Send Code')").first
     _wait_enabled(page, send, 10, "'Send Code'")
-    t_send = time.time()
+    base = mailbox_baseline(creds)      # also fails fast on a wrong IMAP login, before a code is requested
     send.click()
     log("code requested")
 
     code_inp = dlg.locator("input[aria-label='Email code']")
     code_inp.wait_for(state="visible", timeout=25000)
-    code = fetch_code(creds, addr, t_send, exclude=used_codes, log=log)
+    code = fetch_code(creds, addr, base, exclude=used_codes, log=log)
     used_codes.add(code)
     code_inp.click()
     page.keyboard.type(code, delay=random.randint(50, 110))
