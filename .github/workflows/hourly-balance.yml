@@ -1,36 +1,29 @@
 name: hourly-balance
 
+# Started from outside by cron-job.org (HTTP POST to the workflow_dispatch API), not by GitHub's own schedule.
+# One call = one balance report. "Run workflow" on the Actions tab does the same thing by hand.
 on:
-  workflow_dispatch:        # "Run workflow": sends ONE balance report right now (tick "loop" to keep it running instead)
-    inputs:
-      loop:
-        description: "Keep running and report every balance_every_min minutes"
-        type: boolean
-        default: false
-  schedule:
-    - cron: "41 * * * *"    # (re)starts the long-running reporter; it keeps its own clock (GitHub cron is best-effort)
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  # the scheduled reporter runs for hours: manual one-off runs use their own group so they never wait behind it
-  group: hourly-balance-${{ (github.event_name == 'schedule' || inputs.loop) && 'loop' || 'manual' }}
+  group: hourly-balance
   cancel-in-progress: false
 
 jobs:
   balance:
     runs-on: ubuntu-latest
-    timeout-minutes: 355
+    timeout-minutes: 5
     env:
       STATE_KEY: ${{ secrets.STATE_KEY }}
       C4_DATA_REPO: ${{ secrets.C4_DATA_REPO }}
       C4_DATA_TOKEN: ${{ secrets.C4_DATA_TOKEN }}
-      C4_MAX_RUNTIME_MIN: "340"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: pip install requests cryptography
-      - name: Balance reports
-        run: python balance.py ${{ (github.event_name == 'schedule' || inputs.loop) && '--loop' || '' }}
+      - name: Send balance report
+        run: python balance.py
