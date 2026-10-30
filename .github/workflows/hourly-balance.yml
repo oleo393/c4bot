@@ -1,0 +1,29 @@
+name: hourly-balance
+
+on:
+  workflow_dispatch:        # "Run workflow" button: sends the balance report right now
+  schedule:
+    - cron: "5 * * * *"     # every hour at :05 (GitHub may delay it by several minutes)
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hourly-balance
+  cancel-in-progress: true
+
+jobs:
+  balance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      STATE_KEY: ${{ secrets.STATE_KEY }}
+      C4_DATA_REPO: ${{ secrets.C4_DATA_REPO }}
+      C4_DATA_TOKEN: ${{ secrets.C4_DATA_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install requests cryptography
+      - name: Send balance report
+        run: python balance.py
