@@ -392,7 +392,7 @@ def get_cfg():
                 WEBHOOK = hook
         except Exception as e:
             if not _cfg_warned:
-                notify(f"?? config.json is invalid ({e}). Keeping the last good settings.")
+                notify(f"\u26a0\ufe0f config.json is invalid ({e}). Keeping the last good settings.")
                 _cfg_warned = True
     return _last_cfg
 
@@ -904,8 +904,8 @@ def close_session(sess):
         return
     if sess.listing:
         ok = cancel_listing(sess)
-        notify("?? Cancelled the unjoined listing." if ok else
-               "?? Could not cancel the unjoined listing. Please cancel it on the site by hand.")
+        notify("\U0001f9f9 Cancelled the unjoined listing." if ok else
+               "\u26a0\ufe0f Could not cancel the unjoined listing. Please cancel it on the site by hand.")
     sess.close()
 
 
@@ -1107,9 +1107,9 @@ def never_saw_error(sess):
     bad = [st for st, _, ts in sess.api_bad if time.time() - ts < 180]
     cf = is_challenge(page) or any(st in (403, 429, 503) for st in bad)
     return BotError("Created a game but never saw it in the API"
-                    + (f" ， API errors in the last 3 min: {bad[-6:]}" if bad else " ， no API errors seen")
-                    + (f" ， page title '{page_title(page)}'" if cf else "")
-                    + (" ， treating this as a Cloudflare block (slow backoff retry)." if cf else
+                    + (f" \u00b7 API errors in the last 3 min: {bad[-6:]}" if bad else " \u00b7 no API errors seen")
+                    + (f" \u00b7 page title '{page_title(page)}'" if cf else "")
+                    + (" \u00b7 treating this as a Cloudflare block (slow backoff retry)." if cf else
                        ". If 'viewer' is missing from the API response, set player_id in this account's config.json."),
                     shot(page), blocked=cf)
 
@@ -1470,8 +1470,8 @@ def main():
             node_v = "?"
         dlog("ENV", rev=CODE_REV, python=sys.version.split()[0], node=node_v, cpus=os.cpu_count(), load=os.getloadavg(), actions=int(IN_ACTIONS),
              safe_remaining_s=cfg["safe_remaining_s"], min_delay_ms=cfg["min_delay_ms"], solver_total_ms=7000, tt_bits=24)
-    notify(f"?? {LABEL}Connect 4 bot started ， {now_str()} ， rev {CODE_REV}\nBooks: {solver.books}\n"
-           f"Stake {fmt(parse_amount(cfg['stake']))} ， seat {cfg['seat']} ， P/L so far {fmt_signed(stats['pnl'])}")
+    notify(f"\u25b6\ufe0f {LABEL}Connect 4 bot started \u00b7 {now_str()} \u00b7 rev {CODE_REV}\nBooks: {solver.books}\n"
+           f"Stake {fmt(parse_amount(cfg['stake']))} \u00b7 seat {cfg['seat']} \u00b7 P/L so far {fmt_signed(stats['pnl'])}")
     games = errors = 0
     blocked_n, blocked_since = 0, None
     limit_n = 0
@@ -1519,7 +1519,7 @@ def main():
                     if not lobby_ready and not skip_reload:
                         bal = open_lobby(sess)
                         if blocked_n:
-                            notify(f"? Cloudflare cleared after {blocked_n} retries "
+                            notify(f"\u2705 Cloudflare cleared after {blocked_n} retries "
                                    f"({(time.monotonic() - blocked_since) / 60:.0f} min). Resuming.")
                             blocked_n, blocked_since = 0, None
                     lobby_ready = False
@@ -1554,7 +1554,7 @@ def main():
                     dflush(f"after game {games + 1}")
                     if result is None:
                         ok = cancel_listing(sess)      # never leave an unjoined listing behind
-                        notify("? Stopped waiting for an opponent ， " +
+                        notify("\u231b Stopped waiting for an opponent \u00b7 " +
                                ("listing cancelled." if ok else "COULD NOT CANCEL the listing, check the site."))
                         lobby_ready = False
                         continue
@@ -1583,10 +1583,10 @@ def main():
                         bal, lobby_ready = None, False   # blocked: the next loop retries with backoff
                     ne = int(cfg["notify_every"] or 0)
                     if ne and games % ne == 0:
-                        notify(f"?? **{outcome.upper()}{'?' if unknown else ''}** {fmt_signed(profit)} ， stake {fmt(stake)} ， {now_str()}\n"
+                        notify(f"\U0001f3ae **{outcome.upper()}{'?' if unknown else ''}** {fmt_signed(profit)} \u00b7 stake {fmt(stake)} \u00b7 {now_str()}\n"
                                f"Balance: {fmt(bal) if bal is not None else 'unknown (page blocked)'}\n"
-                               f"P/L: {fmt_signed(stats['pnl'])} ， {rec['w']}W {rec['l']}L {rec['d']}D"
-                               + (f" {rec['u']}?" if rec['u'] else "") + f" ， games this run: {games}")
+                               f"P/L: {fmt_signed(stats['pnl'])} \u00b7 {rec['w']}W {rec['l']}L {rec['d']}D"
+                               + (f" {rec['u']}?" if rec['u'] else "") + f" \u00b7 games this run: {games}")
                     time.sleep(END_BUFFER_S)
 
                 except BotError as e:
@@ -1626,7 +1626,7 @@ def main():
                     if e.limit:
                         limit_n += 1
                         if limit_n == 1 or limit_n % 10 == 0:
-                            notify(f"? {LABEL}{e}. Waiting for a slot to free up; retrying about every minute.")
+                            notify(f"\u23f3 {LABEL}{e}. Waiting for a slot to free up; retrying about every minute.")
                         if not nap(random.uniform(45, 75)):
                             reason = "stopped while waiting for a free listing slot"
                             break
@@ -1639,12 +1639,12 @@ def main():
                         wait_min = steps[idx] * random.uniform(0.9, 1.2)
                         blocked_for = (time.monotonic() - blocked_since) / 60
                         if blocked_for + wait_min > float(cfg["cf_give_up_min"]):
-                            notify(f"?? {LABEL}Blocked by Cloudflare for {blocked_for:.0f} min. Giving up for this run; "
+                            notify(f"\U0001f6d1 {LABEL}Blocked by Cloudflare for {blocked_for:.0f} min. Giving up for this run; "
                                    f"the next scheduled run will try again.", e.shot)
                             exit_code, reason = 1, "blocked by Cloudflare"
                             break
                         if blocked_n == 1 or blocked_n % 3 == 0:
-                            notify(f"??? Blocked ({e}) ， attempt {blocked_n}. Retrying in {wait_min:.0f} min.",
+                            notify(f"\U0001f6e1\ufe0f Blocked ({e}) \u00b7 attempt {blocked_n}. Retrying in {wait_min:.0f} min.",
                                    e.shot if blocked_n == 1 else None)
                         close_session(sess); sess = None   # fresh browser for the next try
                         lobby_ready = False
@@ -1652,16 +1652,16 @@ def main():
                             reason = "stopped while waiting out a block"
                             break
                         continue
-                    notify(f"? {LABEL}**Error** ， {now_str()}\n{e}", e.shot)
+                    notify(f"\u274c {LABEL}**Error** \u00b7 {now_str()}\n{e}", e.shot)
                     if e.fatal:
                         stats["dead_hash"] = src_hash
-                        notify(f"?? {LABEL}**Login state is dead. Reload it:** run `python login.py {(ACCOUNT + SFX) or '<name>'} --encrypt` on your PC "
+                        notify(f"\U0001f511 {LABEL}**Login state is dead. Reload it:** run `python login.py {(ACCOUNT + SFX) or '<name>'} --encrypt` on your PC "
                                "(Chrome open with --remote-debugging-port=9222 and logged in), then upload the new "
                                "`state.enc` to the private data repo. The bot stays quiet until the state changes.")
                         exit_code, reason = 2, "logged out"; break
                     errors += 1
                 except Exception as e:
-                    notify(f"? {LABEL}**Unexpected error** ， {now_str()}\n{type(e).__name__}: {e}",
+                    notify(f"\u274c {LABEL}**Unexpected error** \u00b7 {now_str()}\n{type(e).__name__}: {e}",
                            shot(sess.page) if sess else None)
                     errors += 1
 
@@ -1677,8 +1677,8 @@ def main():
             try:
                 if sess.listing:           # terminated while waiting for an opponent: cancel the listing first
                     ok = cancel_listing(sess)
-                    notify("?? Cancelled the unjoined listing before stopping." if ok else
-                           "?? Could not cancel the unjoined listing. Please cancel it on the site by hand.")
+                    notify("\U0001f9f9 Cancelled the unjoined listing before stopping." if ok else
+                           "\u26a0\ufe0f Could not cancel the unjoined listing. Please cancel it on the site by hand.")
             except BaseException:
                 pass
             if exit_code != 2 and not errors:
@@ -1687,7 +1687,7 @@ def main():
         save_stats(stats)
         solver.close()
         dflush("exit")
-        notify(f"?? {LABEL}Connect 4 bot {reason} ， games this run: {games} ， P/L {fmt_signed(stats['pnl'])}")
+        notify(f"\u23f9\ufe0f {LABEL}Connect 4 bot {reason} \u00b7 games this run: {games} \u00b7 P/L {fmt_signed(stats['pnl'])}")
     return exit_code
 
 
