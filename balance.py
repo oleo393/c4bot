@@ -1,25 +1,30 @@
-"""Balance report -> the 'balance_webhook': one line per account (balance, preset, difference) plus OVERALL.
-Reads the last balance each session saved (stats*.enc) from the PRIVATE data repo.
+"""Balance report -> the 'balance_webhook': one line per account (balance, preset, difference, change since the last
+hour) plus an OVERALL line. Reads the last balance each session saved (stats*.enc) from the PRIVATE data repo.
 
-  python balance.py          send ONE report now (manual run)
-  python balance.py --loop   stay alive for the whole job and send a report every `balance_every_min` minutes
-                             (default 60). GitHub's cron is best-effort and often skips or delays hourly runs, so the job
-                             itself keeps the clock; the hourly cron only (re)starts it, `balance_state.json` in the
-                             private repo prevents a duplicate report when a new job takes over.
+  python balance.py          send ONE report now (this is what the hourly cron-job.org call runs)
+  python balance.py --loop   (optional) stay alive and send a report every `balance_every_min` minutes
 
 summary.json (private repo):
   "balance_webhook": "https://discord.com/api/webhooks/...",
   "presets": {"main": "500M", "alt": "200M", ...}      # target balance per account (K / M / B / T suffixes work)
-  "balance_every_min": 60                               # optional
+  "balance_every_min": 60                               # only used by --loop
 difference = balance - preset   (+ = above the target, - = below it)
+chg        = balance now - balance in the report about an hour ago (every report is remembered in
+             balance_state.json in the private repo; a manual extra run does not disturb the hourly comparison)
 """
-import os, re, sys, time
+import json
+import os
+import re
+import sys
+import time
 from datetime import datetime, timezone
 
 from store import Store
 from summary import fmt, fmt_signed, load_json, load_stats, send, sessions_of, table
 
 MULT = {"": 1, "k": 1e3, "m": 1e6, "b": 1e9, "t": 1e12}
+HISTORY_KEEP_S = 3 * 24 * 3600
+MIN_COMPARE_AGE_MIN = 20          # a snapshot younger than this (e.g. a manual re-run) is not used for "change"
 
 
 def parse_amount(v):
@@ -44,6 +49,26 @@ def seconds_until_due(last_sent, every_min, now, tolerance_s=120):
     return float(last_sent or 0) + every_min * 60 - tolerance_s - now
 
 
+def pick_previous(history, now, target_min=60):
+    """The remembered report closest to one hour ago (but at least MIN_COMPARE_AGE_MIN old) -> (age in minutes, snapshot)."""
+    best = None
+    for h in history or []:
+        try:
+            age = (now - float(h["t"])) / 60
+        except (KeyError, TypeError, ValueError):
+            continue
+        if age < MIN_COMPARE_AGE_MIN:
+            continue
+        if best is None or abs(age - target_min) < abs(best[0] - target_min):
+            best = (age, h)
+    return best
+
+
+def age_label(minutes):
+    m = int(round(minutes))
+    return f"{m // 60}h{m % 60:02d}m" if m >= 60 else f"{m}m"
+
+
 def report(root, g):
     webhook = str(g.get("balance_webhook") or "").strip().strip("\"'")
     if not webhook.startswith("https://"):
@@ -51,7 +76,14 @@ def report(root, g):
     presets = {k: parse_amount(v) for k, v in (g.get("presets") or {}).items()}
     accounts = g.get("accounts") or Store(prefix="accounts").list_dirs()
 
-    rows, tot_bal, tot_pre, missing = [], 0.0, 0.0, []
+    state = load_json(root, "balance_state.json", {})
+    now = time.time()
+    prev = pick_previous(state.get("history"), now)
+    prev_bal = (prev[1].get("bal") or {}) if prev else {}
+
+    rows, missing, snapshot = [], [], {}
+    tot_bal = tot_pre = tot_chg = 0.0
+    any_chg = False
     oldest = ("", "")
     for acc in accounts:
         bal, at = None, ""
@@ -65,24 +97,34 @@ def report(root, g):
                 bal, at = st["balance"], st.get("balance_at") or ""
         pre = presets.get(acc)
         if bal is None:
-            rows.append([acc, "n/a", fmt(pre) if pre else "-", "n/a"])
+            rows.append([acc, "n/a", fmt(pre) if pre else "-", "n/a", "n/a"])
             missing.append(acc)
             continue
+        snapshot[acc] = bal
         if not oldest[0] or at < oldest[0]:
             oldest = (at, acc)
+        old = prev_bal.get(acc)
+        chg = fmt_signed(bal - old) if old is not None else "-"
         if pre is None:
-            rows.append([acc, fmt(bal), "-", "-"])
+            rows.append([acc, fmt(bal), "-", "-", chg])
             continue
-        rows.append([acc, fmt(bal), fmt(pre), fmt_signed(bal - pre)])
+        rows.append([acc, fmt(bal), fmt(pre), fmt_signed(bal - pre), chg])
         tot_bal += bal
         tot_pre += pre
+        if old is not None:
+            tot_chg += bal - old
+            any_chg = True
     if not rows:
         raise SystemExit("No accounts found.")
-    rows.append(["OVERALL", fmt(tot_bal), fmt(tot_pre), fmt_signed(tot_bal - tot_pre)])
+    rows.append(["OVERALL", fmt(tot_bal), fmt(tot_pre), fmt_signed(tot_bal - tot_pre), fmt_signed(tot_chg) if any_chg else "-"])
 
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    msg = f"\U0001F4B0 **Balances** \u00b7 {now}\n```\n" + table(rows, ["account", "balance", "preset", "diff"]) + "\n```"
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    msg = f"\U0001F4B0 **Balances** \u00b7 {stamp}\n```\n" + table(rows, ["account", "balance", "preset", "diff", "chg"]) + "\n```"
     notes = []
+    if prev:
+        notes.append(f"chg = change since the report {age_label(prev[0])} ago")
+    else:
+        notes.append("chg: no earlier report to compare with yet (the first one appears with the next report)")
     mins = age_min(oldest[0]) if oldest[0] else None
     if mins is not None and mins >= 60:   # balances only change when a game ends, so say how old the oldest one is
         notes.append(f"oldest reading: {oldest[1]} ({mins // 60}h{mins % 60:02d}m ago, taken after its last finished game)")
@@ -91,10 +133,19 @@ def report(root, g):
     nopre = [a for a in accounts if presets.get(a) is None]
     if nopre:
         notes.append("no preset (not in OVERALL): " + ", ".join(nopre))
-    if notes:
-        msg += "\n" + "\n".join(notes)
+    msg += "\n" + "\n".join(notes)
     send(webhook, msg)
     print("Balance report sent", flush=True)
+
+    # remember this report (for the next hour's comparison) and when it was sent (for --loop)
+    history = [h for h in (state.get("history") or []) if now - float(h.get("t", 0)) < HISTORY_KEEP_S]
+    history.append({"t": now, "bal": snapshot})
+    state.update(last=now, history=history[-80:])
+    try:
+        root.get("balance_state.json")        # refresh the file's sha
+        root.put("balance_state.json", (json.dumps(state) + "\n").encode(), "balance report")
+    except Exception as e:
+        print("could not save balance_state.json:", type(e).__name__, flush=True)
 
 
 def main():
@@ -113,10 +164,7 @@ def main():
             wait = seconds_until_due(state.get("last"), every, time.time())
             if wait <= 0:
                 report(root, g)
-                state["last"] = time.time()
-                root.get("balance_state.json")        # refresh sha
-                root.put("balance_state.json", (__import__("json").dumps(state) + "\n").encode(), "balance report sent")
-                wait = seconds_until_due(state["last"], every, time.time())
+                wait = every * 60 - 120
         except SystemExit as e:
             print("balance report not sent:", e, flush=True)
             wait = 300
