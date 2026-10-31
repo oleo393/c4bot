@@ -1,14 +1,15 @@
 name: daily-summary
 
 # Started from outside by cron-job.org once a day (HTTP POST to the workflow_dispatch API), not by GitHub's own schedule.
-# summary.py sends the report only at/after summary_hour (summary.json) and only once per day, so an extra call is harmless.
+# force=true (default) sends yesterday's report on every call; force=false keeps the guards (only at/after summary_hour,
+# only once per day) and then skips silently when a report for that day was already sent.
 on:
   workflow_dispatch:
     inputs:
       force:
-        description: "Send the report now (for yesterday), ignoring the once-a-day guard"
+        description: "Send the report for yesterday now, ignoring the once-a-day guard. Default true: cron-job.org calls this once a day. Set false only if you call it several times a day."
         type: boolean
-        default: false
+        default: true
 
 permissions:
   contents: read
