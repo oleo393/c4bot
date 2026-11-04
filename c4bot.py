@@ -21,7 +21,7 @@ except Exception:
     pass
 
 HERE = Path(__file__).resolve().parent
-CODE_REV = "2026-10-30-slots+claims+nowindow+cfcycle+headed+autologin2"   # shown in the debug log (ENV line) so you can tell which code ran
+CODE_REV = "2026-11-01-slots+claims+nowindow+cfcycle+headed+autologin2+rain"   # shown in the debug log (ENV line) so you can tell which code ran
 HEADLESS = "--headed" not in sys.argv
 LOBBY_URL = "https://donutflip.net/connect-four"
 HOME_URL = "https://donutflip.net/"
@@ -64,6 +64,7 @@ DEFAULT_CFG = {
     "human_steps": 3,           # mouse-move steps of the human click (each step costs ~0.25 s on a busy runner)
     "click_mode": "fast",       # "fast" = one in-page click (like the old extension), "human" = scroll + mouse path (slow: ~0.25 s per mouse step on the runner)
     "webhook": "",              # this account's Discord webhook (private repo only); falls back to the DISCORD_WEBHOOK_URL env / .secret
+    "auto_rain": True,          # join the hourly chat rain with a free session (between games); false = never
     "auto_login": False,        # true = log in again by e-mail code when the saved session expired (needs login_email + login.json)
     "login_email": "",          # the address this DonutFlip account signs in with (the duck.com alias); same for all sessions
     "debug": 0,                 # 0 = off, 1 = timing log sent to the private Discord webhook after each game, 2 = also print to stdout
@@ -1436,6 +1437,124 @@ def do_auto_login(sess, cfg):
     return False
 
 
+# ---------------------------------------------------------------- chat rain (join once per round, with a free session)
+# The sidebar shows "<mm:ss> [Join]". The button stays "Join" after you joined, so the bot remembers the round: after
+# joining (or seeing "You're in this rain") it does not look at the rain again until the countdown has run out.
+RAIN_JS = """() => {
+  const panel = document.querySelector('#live-chat-panel');
+  if (!panel) return null;
+  const btn = [...panel.querySelectorAll('button')].find(b => b.textContent.trim() === 'Join');
+  if (!btn) return null;
+  const t = [...btn.parentElement.children].map(e => e.textContent.trim()).find(x => /^\\d{1,2}(:\\d{2}){1,2}$/.test(x)) || null;
+  return {timer: t, disabled: !!btn.disabled};
+}"""
+_rain = {"skip_until": 0.0, "logged_ineligible": False}
+RAIN_FILE = "rain.json"
+
+
+def _mmss(text):
+    """'19:26' -> 1166, '1:05:00' -> 3900, None if unreadable."""
+    try:
+        sec = 0
+        for part in str(text).split(":"):
+            sec = sec * 60 + int(part)
+        return sec
+    except (TypeError, ValueError):
+        return None
+
+
+def rain_shared_until():
+    """Another session of this account already took care of this round until this epoch time."""
+    if CSTORE is None:
+        return 0.0
+    try:
+        blob = CSTORE.get(RAIN_FILE)
+        return float(json.loads(blob.decode("utf-8-sig")).get("until") or 0) if blob else 0.0
+    except Exception:
+        return 0.0
+
+
+def rain_shared_set(until):
+    if CSTORE is None:
+        return
+    try:
+        CSTORE.get(RAIN_FILE)
+        CSTORE.put_once(RAIN_FILE, (json.dumps({"until": until, "by": ME}) + "\n").encode(), "rain round")
+    except Exception:
+        pass
+
+
+def close_rain_popup(page):
+    for attempt in range(3):
+        try:
+            if page.locator("button[data-joined]").count() == 0:
+                return True
+            if attempt < 2:
+                page.keyboard.press("Escape")
+            else:
+                page.locator("button[aria-label='Close rain pool']").first.click(timeout=3000)
+            page.wait_for_timeout(500)
+        except Exception:
+            pass
+    try:
+        return page.locator("button[data-joined]").count() == 0
+    except Exception:
+        return False
+
+
+def maybe_join_rain(sess):
+    """Called while this session is free (between games). Opens the rain window only when a new round is running."""
+    now = time.time()
+    if now < _rain["skip_until"]:
+        return
+    shared = rain_shared_until()
+    if now < shared:
+        _rain["skip_until"] = shared
+        return
+    page = sess.page
+    close_game_window(page)                       # a game window of another session must not cover the chat
+    info = page.evaluate(RAIN_JS)
+    if not info:
+        _rain["skip_until"] = now + 90            # no rain banner right now (or the chat is hidden)
+        return
+    left = _mmss(info.get("timer"))
+    page.locator("#live-chat-panel").get_by_role("button", name="Join", exact=True).first.click(timeout=5000)
+    btn = page.locator("button[data-joined]").first
+    btn.wait_for(state="visible", timeout=10000)
+    try:                                           # the window shows the exact countdown: "Drops in 20:42"
+        txt = page.locator("text=/Drops in/").first.inner_text(timeout=1500)
+        m = re.search(r"(\d{1,2}(?::\d{2}){1,2})", txt)
+        left = _mmss(m.group(1)) if m else left
+    except Exception:
+        pass
+    round_until = now + (left if left else 900) + 30
+    state = btn.get_attribute("data-joined")
+    verdict = None
+    if state == "true":
+        verdict = "already in"
+    elif btn.is_enabled():
+        btn.click(timeout=5000)
+        for _ in range(24):                        # the button turns into "You're in this rain" (data-joined="true")
+            page.wait_for_timeout(250)
+            if btn.get_attribute("data-joined") == "true":
+                verdict = "joined"
+                break
+    else:
+        if not _rain["logged_ineligible"]:
+            _rain["logged_ineligible"] = True
+            print("[rain] the Join button is disabled in the rain window (not eligible?), skipping for 20 min", flush=True)
+        _rain["skip_until"] = now + 1200
+    close_rain_popup(page)
+    if verdict:
+        _rain["skip_until"] = round_until
+        rain_shared_set(round_until)
+        if verdict == "joined":
+            notify_bg(f"\U0001F327\uFE0F {LABEL}Joined the rain (drops in {(left or 0) // 60}:{(left or 0) % 60:02d})")
+        print(f"[rain] {verdict}; next look in about {int((round_until - now) / 60)} min", flush=True)
+    elif _rain["skip_until"] <= now:
+        _rain["skip_until"] = now + 300            # could not confirm: try again in 5 min
+
+
 class Stop(Exception):
     pass
 
@@ -1527,6 +1646,16 @@ def main():
                     if bal < stake or (cfg["min_balance"] and bal < parse_amount(cfg["min_balance"])):
                         reason = f"balance {fmt(bal)} is below the stake/min_balance"; break
 
+                    if cfg.get("auto_rain", True):
+                        try:
+                            maybe_join_rain(sess)
+                        except Exception as ex:
+                            print("rain check failed:", type(ex).__name__, flush=True)
+                            _rain["skip_until"] = time.time() + 300
+                            try:
+                                close_rain_popup(sess.page)
+                            except Exception:
+                                pass
                     create_game(sess, stake)
                     try:
                         result = play_game(sess, solver, float(cfg["opponent_wait_s"]))
